@@ -1,0 +1,16 @@
+[build-system]
+requires = ["setuptools>=68.0", "wheel"]
+build-backend = "setuptools.backends._legacy:_Backend"
+
+[project]
+name = "forex-bot"
+version = "0.1.0"
+description = "Professional automated forex trading bot"
+requires-python = ">=3.11"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-v --cov=src --cov-report=term-missing"
+
+[tool.setuptools.packages.find]
+include = ["src*"]

@@ -1,0 +1,104 @@
+broker:
+  environment: "demo"
+  base_url_demo: "https://api-fxpractice.oanda.com"
+  base_url_live: "https://api-fxtrade.oanda.com"
+  instruments:
+    - "EUR_USD"
+    - "GBP_USD"
+    - "GBP_JPY"
+    - "XAU_USD"
+  primary_timeframe: "M15"
+  confirmation_timeframe: "H1"
+  context_timeframe: "H4"
+  historical_candles_on_startup: 500
+
+risk:
+  per_trade_pct: 0.01
+  daily_max_pct: 0.03
+  weekly_max_pct: 0.08
+  monthly_max_pct: 0.15
+  max_trades_per_day: 3
+  min_risk_reward: 3.0
+  min_risk_reward_after_spread: 2.5
+  min_sl_atr_multiple: 1.0
+  max_sl_atr_multiple: 3.0
+
+strategy:
+  liquidity_threshold_pct: 0.02
+  atr_period: 14
+  atr_average_period: 50
+  volatility_multiplier: 1.3
+  sweep_wick_body_ratio: 1.5
+  sweep_candle_lookback: 3
+  pullback_candle_limit: 5
+  pivot_lookback: 5
+  ranging_candle_threshold: 10
+  ranging_atr_multiple: 0.7
+
+spread:
+  max_pips:
+    EUR_USD: 1.5
+    GBP_USD: 2.0
+    GBP_JPY: 3.0
+    XAU_USD: 35.0
+  spike_multiplier: 3.0
+  rolling_average_period: 20
+  recheck_interval_seconds: 10
+
+slippage:
+  max_pips:
+    majors: 1.5
+    exotics: 3.0
+  limit_order_tolerance_pips: 0.5
+  partial_fill_min_pct: 0.80
+  fill_confirmation_timeout_seconds: 30
+
+news:
+  block_minutes_before: 30
+  block_minutes_after: 30
+  cache_refresh_hours: 12
+  impact_levels_to_block:
+    - "HIGH"
+
+sessions:
+  asian_start_utc: "00:00"
+  asian_end_utc: "07:00"
+  london_start_utc: "07:00"
+  london_end_utc: "12:00"
+  ny_start_utc: "12:00"
+  ny_end_utc: "20:00"
+  overlap_start_utc: "12:00"
+  overlap_end_utc: "16:00"
+  allowed_sessions:
+    - "LONDON"
+    - "NEW_YORK"
+    - "OVERLAP"
+
+trade_management:
+  breakeven_trigger_r: 1.0
+  partial_close_trigger_r: 2.0
+  partial_close_pct: 0.50
+  full_close_trigger_r: 3.0
+  trailing_stop_atr_multiple: 1.0
+  max_trade_duration_hours: 24
+  volatility_collapse_atr_multiple: 0.7
+
+circuit_breaker:
+  consecutive_losses_pause: 3
+  consecutive_losses_pause_hours: 4
+  state_file_path: "data/circuit_breaker_state.json"
+
+correlation_groups:
+  - ["EUR_USD", "GBP_USD"]
+  - ["EUR_USD", "USD_CHF"]
+  - ["XAU_USD", "AUD_USD"]
+
+logging:
+  level: "INFO"
+  log_dir: "logs/"
+  max_file_size_mb: 50
+  backup_count: 10
+
+telegram:
+  enabled: true
+  daily_summary_utc: "21:00"
