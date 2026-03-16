@@ -1,0 +1,8 @@
+.env
+*.db
+logs/
+__pycache__/
+*.pyc
+.pytest_cache/
+.coverage
+data/historical/*.db
