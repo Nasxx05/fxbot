@@ -1,0 +1,2 @@
+# fxbot
+fun bot
