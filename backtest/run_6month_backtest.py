@@ -14,8 +14,8 @@ from src.logger import BotLogger
 INSTRUMENTS = ["EUR_USD", "GBP_USD", "GBP_JPY", "XAU_USD"]
 
 # Most recent 6 months of available data
-START_DATE = "2024-07-01"
-END_DATE = "2024-12-31"
+START_DATE = "2025-07-01"
+END_DATE = "2025-12-31"
 
 SPREAD_MAP = {
     "EUR_USD": 1.2,
