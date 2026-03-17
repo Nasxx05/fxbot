@@ -97,11 +97,14 @@ class StructureEngine:
         return None
 
     def get_last_swing_high(self, df: pd.DataFrame, after_index: int) -> float or None:
-        """Return the price of the most recent swing high after the given index.
+        """Return the price of the most recent swing high near the sweep.
+
+        First looks for swing highs after the sweep. If none found, uses the
+        most recent swing high before the sweep as the BOS reference level.
 
         Args:
             df: DataFrame with is_swing_high and swing_high_price columns.
-            after_index: Only consider swing highs after this candle index.
+            after_index: The sweep candle index.
 
         Returns:
             Swing high price or None if not found.
@@ -110,19 +113,29 @@ class StructureEngine:
             self.logger.log("DEBUG", "structure", "Missing swing point columns")
             return None
 
+        # First try after sweep
         after = df.loc[df.index > after_index]
         swing_highs = after.loc[after["is_swing_high"] == True, "swing_high_price"]
-        if swing_highs.empty:
-            return None
+        if not swing_highs.empty:
+            return float(swing_highs.iloc[-1])
 
-        return float(swing_highs.iloc[-1])
+        # Fall back to most recent swing high within 20 candles before the sweep
+        before = df.loc[(df.index <= after_index) & (df.index >= after_index - 20)]
+        swing_highs = before.loc[before["is_swing_high"] == True, "swing_high_price"]
+        if not swing_highs.empty:
+            return float(swing_highs.iloc[-1])
+
+        return None
 
     def get_last_swing_low(self, df: pd.DataFrame, after_index: int) -> float or None:
-        """Return the price of the most recent swing low after the given index.
+        """Return the price of the most recent swing low near the sweep.
+
+        First looks for swing lows after the sweep. If none found, uses the
+        most recent swing low within 20 candles before the sweep.
 
         Args:
             df: DataFrame with is_swing_low and swing_low_price columns.
-            after_index: Only consider swing lows after this candle index.
+            after_index: The sweep candle index.
 
         Returns:
             Swing low price or None if not found.
@@ -131,12 +144,19 @@ class StructureEngine:
             self.logger.log("DEBUG", "structure", "Missing swing point columns")
             return None
 
+        # First try after sweep
         after = df.loc[df.index > after_index]
         swing_lows = after.loc[after["is_swing_low"] == True, "swing_low_price"]
-        if swing_lows.empty:
-            return None
+        if not swing_lows.empty:
+            return float(swing_lows.iloc[-1])
 
-        return float(swing_lows.iloc[-1])
+        # Fall back to most recent swing low within 20 candles before the sweep
+        before = df.loc[(df.index <= after_index) & (df.index >= after_index - 20)]
+        swing_lows = before.loc[before["is_swing_low"] == True, "swing_low_price"]
+        if not swing_lows.empty:
+            return float(swing_lows.iloc[-1])
+
+        return None
 
     def detect_pullback_zone(self, df: pd.DataFrame, sweep: dict, bos: dict) -> dict or None:
         """Calculate the pullback entry zone after a BOS is confirmed.

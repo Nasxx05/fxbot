@@ -117,70 +117,192 @@ class BacktestEngine:
 
         self.results = []
         daily_count = {}
+        lookback = 200
+        active_sweeps = []
+        sweep_expiry = 30
+        cooldown_until = 0
+
+        # Pre-extract arrays for fast access
+        opens = df["open"].values
+        highs = df["high"].values
+        lows = df["low"].values
+        closes = df["close"].values
+        atrs = df["atr_14"].values
+        sessions_arr = df["session"].values if "session" in df.columns else np.array(["OFF_HOURS"] * len(df))
+        timestamps = df["timestamp"].values
+        vol_regimes = df["volatility_regime"].values if "volatility_regime" in df.columns else None
+        is_swing_high = df["is_swing_high"].values if "is_swing_high" in df.columns else None
+        is_swing_low = df["is_swing_low"].values if "is_swing_low" in df.columns else None
+        swing_high_prices = df["swing_high_price"].values if "swing_high_price" in df.columns else None
+        swing_low_prices = df["swing_low_price"].values if "swing_low_price" in df.columns else None
+
+        # Pre-extract zone columns
+        zone_cols = {}
+        for col in ["prev_day_high", "prev_day_low", "asian_session_high", "asian_session_low",
+                     "london_session_high", "london_session_low", "equal_high_level", "equal_low_level",
+                     "swing_high_price", "swing_low_price"]:
+            if col in df.columns:
+                zone_cols[col] = df[col].values
+
+        sweep_wick_ratio = le.sweep_wick_body_ratio
+        sweep_lookback = le.sweep_candle_lookback
 
         warmup = 100
         for i in range(warmup, len(df)):
-            candle_df = df.iloc[:i + 1].copy()
-            current = candle_df.iloc[-1]
+            if i < cooldown_until:
+                continue
 
-            # Session filter
-            session = current.get("session", "OFF_HOURS")
+            session = str(sessions_arr[i])
             if session not in self.allowed_sessions:
                 continue
 
-            # Daily limit
-            trade_date = str(current["timestamp"].date())
+            ts = pd.Timestamp(timestamps[i])
+            trade_date = str(ts.date())
             if daily_count.get(trade_date, 0) >= self.max_trades_per_day:
                 continue
 
-            # Volatility regime
-            if "volatility_regime" in candle_df.columns:
-                regime = candle_df["volatility_regime"].iloc[-1]
-                if regime == "RANGING":
-                    continue
+            if vol_regimes is not None and vol_regimes[i] == "RANGING":
+                continue
 
-            # Sweep detection
-            zones = le.get_active_zones(candle_df)
-            sweep = None
-            for zone in zones:
-                s = le.detect_sweep(candle_df, zone)
-                if s is not None:
-                    sweep = s
+            # Fast inline sweep detection using arrays
+            start_sweep = max(0, i - sweep_lookback + 1)
+            zones = self._get_zones_from_arrays(zone_cols, i)
+
+            for zone_type, price in zones:
+                is_high_zone = "HIGH" in zone_type
+                for j in range(start_sweep, i + 1):
+                    body = abs(closes[j] - opens[j])
+                    if body == 0:
+                        continue
+                    if is_high_zone:
+                        if highs[j] <= price or closes[j] >= price:
+                            continue
+                        wick = highs[j] - max(closes[j], opens[j])
+                    else:
+                        if lows[j] >= price or closes[j] <= price:
+                            continue
+                        wick = min(closes[j], opens[j]) - lows[j]
+
+                    if wick < sweep_wick_ratio * body:
+                        continue
+
+                    direction = "BULLISH_SWEEP" if not is_high_zone else "BEARISH_SWEEP"
+                    active_sweeps.append({
+                        "zone": {"type": zone_type, "price": price},
+                        "sweep_candle_index": j,
+                        "sweep_high": float(highs[j]),
+                        "sweep_low": float(lows[j]),
+                        "direction": direction,
+                        "detected_at": i,
+                    })
                     break
 
-            if sweep is None:
+            # Expire old sweeps
+            active_sweeps = [s for s in active_sweeps
+                             if i - s["detected_at"] <= sweep_expiry]
+
+            if not active_sweeps:
                 continue
 
-            # BOS detection
-            bos = se.detect_break_of_structure(candle_df, sweep)
-            if bos is None:
+            # Fast inline BOS detection
+            bos = None
+            used_sweep = None
+            for sweep in active_sweeps:
+                sweep_idx = sweep["sweep_candle_index"]
+                sweep_dir = sweep["direction"]
+
+                if sweep_dir == "BULLISH_SWEEP":
+                    # Find most recent swing high near sweep
+                    bos_level = None
+                    # After sweep
+                    for k in range(min(i, sweep_idx + 1), i + 1):
+                        if is_swing_high is not None and is_swing_high[k]:
+                            bos_level = swing_high_prices[k]
+                    # If none, look before sweep (within 20 candles)
+                    if bos_level is None:
+                        for k in range(max(0, sweep_idx - 20), sweep_idx + 1):
+                            if is_swing_high is not None and is_swing_high[k]:
+                                bos_level = swing_high_prices[k]
+
+                    if bos_level is None or np.isnan(bos_level):
+                        continue
+
+                    # Check if any candle after sweep closes above bos_level
+                    for k in range(sweep_idx + 1, i + 1):
+                        if closes[k] > bos_level:
+                            bos = {
+                                "direction": "BULLISH",
+                                "bos_level": bos_level,
+                                "bos_candle_index": k,
+                            }
+                            used_sweep = sweep
+                            break
+
+                elif sweep_dir == "BEARISH_SWEEP":
+                    bos_level = None
+                    for k in range(min(i, sweep_idx + 1), i + 1):
+                        if is_swing_low is not None and is_swing_low[k]:
+                            bos_level = swing_low_prices[k]
+                    if bos_level is None:
+                        for k in range(max(0, sweep_idx - 20), sweep_idx + 1):
+                            if is_swing_low is not None and is_swing_low[k]:
+                                bos_level = swing_low_prices[k]
+
+                    if bos_level is None or np.isnan(bos_level):
+                        continue
+
+                    for k in range(sweep_idx + 1, i + 1):
+                        if closes[k] < bos_level:
+                            bos = {
+                                "direction": "BEARISH",
+                                "bos_level": bos_level,
+                                "bos_candle_index": k,
+                            }
+                            used_sweep = sweep
+                            break
+
+                if bos is not None:
+                    break
+
+            if bos is None or used_sweep is None:
                 continue
 
-            # Pullback zone
-            pullback = se.detect_pullback_zone(candle_df, sweep, bos)
-            if pullback is None:
+            # BOS candle quality check: body must be > 50% of total range
+            bos_idx = bos["bos_candle_index"]
+            bos_body = abs(closes[bos_idx] - opens[bos_idx])
+            bos_range = highs[bos_idx] - lows[bos_idx]
+            if bos_range > 0 and bos_body / bos_range < 0.3:
                 continue
 
-            # Volatility confirmation
-            if not ve.is_volatility_sufficient(candle_df, sweep=sweep):
+            # Inline pullback zone (50% retrace)
+            sweep_high = used_sweep["sweep_high"]
+            sweep_low = used_sweep["sweep_low"]
+            sweep_range = sweep_high - sweep_low
+            if sweep_range <= 0:
                 continue
 
-            # Determine direction and entry
             direction = "LONG" if bos["direction"] == "BULLISH" else "SHORT"
-            entry_price = pullback["entry_price"]
+            if direction == "SHORT":
+                zone_high = sweep_low + (sweep_range * 0.5)
+                zone_low = sweep_low + (sweep_range * 0.3)
+            else:
+                zone_low = sweep_high - (sweep_range * 0.5)
+                zone_high = sweep_high - (sweep_range * 0.3)
+
+            entry_price = (zone_high + zone_low) / 2
 
             # Calculate SL and TP
-            atr = candle_df["atr_14"].iloc[-1]
-            if pd.isna(atr) or atr <= 0:
+            atr = atrs[i]
+            if np.isnan(atr) or atr <= 0:
                 continue
 
-            eff_spread = spread_pips if spread_pips is not None else self._sim_spread(current["timestamp"])
+            eff_spread = spread_pips if spread_pips is not None else self._sim_spread(ts)
             spread_price = self._pips_to_price(instrument, eff_spread)
 
             if direction == "LONG":
-                sl = sweep["sweep_low"] - (0.5 * atr) - spread_price
+                sl = used_sweep["sweep_low"] - (0.5 * atr) - spread_price
             else:
-                sl = sweep["sweep_high"] + (0.5 * atr) + spread_price
+                sl = used_sweep["sweep_high"] + (0.5 * atr) + spread_price
 
             sl_distance = abs(entry_price - sl)
             if sl_distance < self.min_sl_atr_multiple * atr:
@@ -197,7 +319,6 @@ class BacktestEngine:
                 tp1 = entry_price - risk * 2
                 tp2 = entry_price - risk * 3
 
-            # Spread-adjusted RR
             adjusted_risk = risk + self._pips_to_price(instrument, eff_spread)
             rr_adjusted = abs(tp2 - entry_price) / adjusted_risk if adjusted_risk > 0 else 0
             if rr_adjusted < self.min_rr_after_spread:
@@ -210,8 +331,8 @@ class BacktestEngine:
                 "stop_loss": sl,
                 "take_profit_1": tp1,
                 "take_profit_2": tp2,
-                "entry_zone_high": pullback.get("zone_high", entry_price + 0.001),
-                "entry_zone_low": pullback.get("zone_low", entry_price - 0.001),
+                "entry_zone_high": zone_high,
+                "entry_zone_low": zone_low,
                 "session": session,
                 "atr": atr,
             }
@@ -225,6 +346,9 @@ class BacktestEngine:
             self.results.append(result)
             if result["status"] != "EXPIRED":
                 daily_count[trade_date] = daily_count.get(trade_date, 0) + 1
+
+            active_sweeps = [s for s in active_sweeps if s is not used_sweep]
+            cooldown_until = i + self.pullback_candle_limit + 5
 
         return self.calculate_metrics(self.results)
 
@@ -632,12 +756,26 @@ class BacktestEngine:
         net_pnl = sum(w.get("total_net_pnl_usd", 0) for w in windows)
 
         win_rate = (wins / total * 100) if total > 0 else 0
-        # Approximate profit factor from window-level data
-        gross_p = sum(w.get("total_net_pnl_usd", 0)
-                      for w in windows if w.get("total_net_pnl_usd", 0) > 0)
-        gross_l = abs(sum(w.get("total_net_pnl_usd", 0)
-                          for w in windows if w.get("total_net_pnl_usd", 0) < 0))
-        pf = gross_p / gross_l if gross_l > 0 else 0
+
+        # Use per-window profit factors to estimate combined PF
+        total_gross_profit = 0
+        total_gross_loss = 0
+        for w in windows:
+            w_wins = w.get("winning_trades", 0)
+            w_losses = w.get("losing_trades", 0)
+            w_pnl = w.get("total_net_pnl_usd", 0)
+            w_pf = w.get("profit_factor", 0)
+            if w_pnl > 0:
+                total_gross_profit += w_pnl
+            else:
+                total_gross_loss += abs(w_pnl)
+
+        if total_gross_loss > 0:
+            pf = total_gross_profit / total_gross_loss
+        elif total_gross_profit > 0:
+            pf = 999.0
+        else:
+            pf = 0
 
         return {
             "total_trades": total,
@@ -693,6 +831,62 @@ class BacktestEngine:
         print(f"Avg Duration:    {metrics.get('average_trade_duration_hours', 0):.1f}h")
         print(f"Expired:         {metrics.get('expired_trades', 0)}")
         print("=" * 60)
+
+    def _get_zones_from_arrays(self, zone_cols: dict, i: int) -> list:
+        """Build zone list from pre-extracted arrays at index i."""
+        zones = []
+        type_map = {
+            "prev_day_high": "PREV_DAY_HIGH",
+            "prev_day_low": "PREV_DAY_LOW",
+            "asian_session_high": "ASIAN_HIGH",
+            "asian_session_low": "ASIAN_LOW",
+            "london_session_high": "LONDON_HIGH",
+            "london_session_low": "LONDON_LOW",
+            "equal_high_level": "EQUAL_HIGH",
+            "equal_low_level": "EQUAL_LOW",
+            "swing_high_price": "SWING_HIGH",
+            "swing_low_price": "SWING_LOW",
+        }
+        for col, zone_type in type_map.items():
+            if col in zone_cols:
+                val = zone_cols[col][i]
+                if not np.isnan(val):
+                    zones.append((zone_type, float(val)))
+        return zones
+
+    def _get_zones_from_row(self, row) -> list:
+        """Build liquidity zone list from pre-computed DataFrame columns."""
+        zones = []
+        zone_map = {
+            "PREV_DAY_HIGH": "prev_day_high",
+            "PREV_DAY_LOW": "prev_day_low",
+            "ASIAN_HIGH": "asian_session_high",
+            "ASIAN_LOW": "asian_session_low",
+            "LONDON_HIGH": "london_session_high",
+            "LONDON_LOW": "london_session_low",
+            "EQUAL_HIGH": "equal_high_level",
+            "EQUAL_LOW": "equal_low_level",
+        }
+        for zone_type, col in zone_map.items():
+            price = row.get(col)
+            if price is not None and not (isinstance(price, float) and np.isnan(price)):
+                zones.append({
+                    "type": zone_type,
+                    "price": float(price),
+                    "strength": 1,
+                    "active": True,
+                })
+
+        # Add recent swing highs/lows
+        sh = row.get("swing_high_price")
+        if sh is not None and not (isinstance(sh, float) and np.isnan(sh)):
+            zones.append({"type": "SWING_HIGH", "price": float(sh),
+                          "strength": 1, "active": True})
+        sl = row.get("swing_low_price")
+        if sl is not None and not (isinstance(sl, float) and np.isnan(sl)):
+            zones.append({"type": "SWING_LOW", "price": float(sl),
+                          "strength": 1, "active": True})
+        return zones
 
     def _sim_spread(self, timestamp) -> float:
         """Simulate realistic spread based on time of day."""

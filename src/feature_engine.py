@@ -214,30 +214,28 @@ class FeatureEngine:
         Returns:
             DataFrame with volatility_regime column added.
         """
-        regimes = []
+        atr_arr = df["atr_14"].values
+        avg_arr = df["atr_average"].values
+        n = len(df)
+        regimes = np.empty(n, dtype=object)
+
         below_count = 0
+        for i in range(n):
+            atr = atr_arr[i]
+            avg = avg_arr[i]
 
-        for i in range(len(df)):
-            atr = df["atr_14"].iloc[i]
-            avg = df["atr_average"].iloc[i]
-
-            if pd.isna(atr) or pd.isna(avg):
-                regimes.append("NORMAL")
+            if np.isnan(atr) or np.isnan(avg):
+                regimes[i] = "NORMAL"
                 below_count = 0
-                continue
-
-            if atr > avg * self.volatility_multiplier:
-                regimes.append("EXPANDING")
+            elif atr > avg * self.volatility_multiplier:
+                regimes[i] = "EXPANDING"
                 below_count = 0
             elif atr < avg:
                 below_count += 1
-                if below_count >= self.ranging_candle_threshold:
-                    regimes.append("RANGING")
-                else:
-                    regimes.append("NORMAL")
+                regimes[i] = "RANGING" if below_count >= self.ranging_candle_threshold else "NORMAL"
             else:
                 below_count = 0
-                regimes.append("NORMAL")
+                regimes[i] = "NORMAL"
 
         df["volatility_regime"] = regimes
         return df
@@ -279,6 +277,8 @@ class FeatureEngine:
         """Detect equal highs and equal lows from recent swing points.
 
         Equal highs/lows are swing points within liquidity_threshold_pct of each other.
+        Uses a vectorized approach: for each swing point, check if any other swing
+        point within the lookback window is within the threshold.
 
         Args:
             df: DataFrame with swing_high_price, swing_low_price columns.
@@ -292,48 +292,43 @@ class FeatureEngine:
         df["equal_high_level"] = np.nan
         df["equal_low_level"] = np.nan
 
-        lookback = min(50, len(df))
-        recent = df.tail(lookback)
-
-        swing_highs = recent.loc[recent["swing_high_price"].notna(), "swing_high_price"].values
-        swing_lows = recent.loc[recent["swing_low_price"].notna(), "swing_low_price"].values
-
-        if len(df) == 0:
+        if df.empty:
             return df
 
-        current_price = df["close"].iloc[-1]
-        threshold = current_price * self.liquidity_threshold_pct
+        # Get swing point indices and values
+        sh_mask = df["swing_high_price"].notna()
+        sl_mask = df["swing_low_price"].notna()
 
-        if len(swing_highs) >= 2:
-            for i in range(len(swing_highs)):
-                for j in range(i + 1, len(swing_highs)):
-                    if abs(swing_highs[i] - swing_highs[j]) <= threshold:
-                        df.iloc[-1, df.columns.get_loc("near_equal_high")] = True
-                        df.iloc[-1, df.columns.get_loc("equal_high_level")] = (
-                            swing_highs[i] + swing_highs[j]
-                        ) / 2
-                        break
-                if df["near_equal_high"].iloc[-1]:
-                    break
+        sh_indices = np.where(sh_mask)[0]
+        sl_indices = np.where(sl_mask)[0]
+        sh_prices = df.loc[sh_mask, "swing_high_price"].values
+        sl_prices = df.loc[sl_mask, "swing_low_price"].values
 
-        if len(swing_lows) >= 2:
-            for i in range(len(swing_lows)):
-                for j in range(i + 1, len(swing_lows)):
-                    if abs(swing_lows[i] - swing_lows[j]) <= threshold:
-                        df.iloc[-1, df.columns.get_loc("near_equal_low")] = True
-                        df.iloc[-1, df.columns.get_loc("equal_low_level")] = (
-                            swing_lows[i] + swing_lows[j]
-                        ) / 2
-                        break
-                if df["near_equal_low"].iloc[-1]:
-                    break
+        # For each pair of consecutive swing highs, mark equal levels
+        for i in range(1, len(sh_prices)):
+            threshold = sh_prices[i] * self.liquidity_threshold_pct
+            if abs(sh_prices[i] - sh_prices[i - 1]) <= threshold:
+                level = (sh_prices[i] + sh_prices[i - 1]) / 2
+                start = sh_indices[i]
+                end = min(start + 96, len(df))  # Propagate for ~1 day of M15 candles
+                df.iloc[start:end, df.columns.get_loc("near_equal_high")] = True
+                df.iloc[start:end, df.columns.get_loc("equal_high_level")] = level
+
+        for i in range(1, len(sl_prices)):
+            threshold = sl_prices[i] * self.liquidity_threshold_pct
+            if abs(sl_prices[i] - sl_prices[i - 1]) <= threshold:
+                level = (sl_prices[i] + sl_prices[i - 1]) / 2
+                start = sl_indices[i]
+                end = min(start + 96, len(df))
+                df.iloc[start:end, df.columns.get_loc("near_equal_low")] = True
+                df.iloc[start:end, df.columns.get_loc("equal_low_level")] = level
 
         return df
 
     def compute_previous_day_levels(self, df: pd.DataFrame) -> pd.DataFrame:
-        """Compute the previous day's high and low levels.
+        """Compute the previous day's high and low levels per candle.
 
-        Uses UTC midnight-to-midnight boundaries.
+        Each candle gets the high/low from the calendar day before its own date.
 
         Args:
             df: DataFrame with timezone-aware UTC timestamp, high, low columns.
@@ -352,25 +347,30 @@ class FeatureEngine:
             ts = pd.to_datetime(ts, utc=True)
 
         dates = ts.dt.date
-        unique_dates = sorted(dates.unique())
 
-        if len(unique_dates) < 2:
-            return df
+        # Compute daily high/low using groupby
+        daily_stats = df.groupby(dates).agg(
+            day_high=("high", "max"),
+            day_low=("low", "min"),
+        )
 
-        prev_date = unique_dates[-2]
-        prev_day_mask = dates == prev_date
-        prev_day_data = df.loc[prev_day_mask]
+        # Shift to get previous day's values
+        daily_stats["prev_high"] = daily_stats["day_high"].shift(1)
+        daily_stats["prev_low"] = daily_stats["day_low"].shift(1)
 
-        if not prev_day_data.empty:
-            prev_high = prev_day_data["high"].max()
-            prev_low = prev_day_data["low"].min()
-            df["prev_day_high"] = prev_high
-            df["prev_day_low"] = prev_low
+        # Map back to each row
+        date_to_prev_high = daily_stats["prev_high"].to_dict()
+        date_to_prev_low = daily_stats["prev_low"].to_dict()
+
+        df["prev_day_high"] = dates.map(date_to_prev_high).values
+        df["prev_day_low"] = dates.map(date_to_prev_low).values
 
         return df
 
     def compute_session_levels(self, df: pd.DataFrame) -> pd.DataFrame:
-        """Compute the high and low of the most recent Asian and London sessions.
+        """Compute per-day session highs and lows for Asian and London sessions.
+
+        Each candle gets the session levels from its own calendar day.
 
         Args:
             df: DataFrame with timezone-aware UTC timestamp, high, low columns.
@@ -390,14 +390,25 @@ class FeatureEngine:
         if "session" not in df.columns:
             df = self.compute_session_tag(df)
 
-        asian_candles = df[df["session"] == "ASIAN"]
-        if not asian_candles.empty:
-            df["asian_session_high"] = asian_candles["high"].max()
-            df["asian_session_low"] = asian_candles["low"].min()
+        ts = df["timestamp"]
+        if not hasattr(ts.iloc[0], "date"):
+            ts = pd.to_datetime(ts, utc=True)
+        dates = ts.dt.date
 
-        london_candles = df[df["session"] == "LONDON"]
-        if not london_candles.empty:
-            df["london_session_high"] = london_candles["high"].max()
-            df["london_session_low"] = london_candles["low"].min()
+        for session_name, h_col, l_col in [
+            ("ASIAN", "asian_session_high", "asian_session_low"),
+            ("LONDON", "london_session_high", "london_session_low"),
+        ]:
+            mask = df["session"] == session_name
+            session_df = df.loc[mask]
+            if session_df.empty:
+                continue
+
+            session_dates = dates[mask]
+            day_highs = session_df.groupby(session_dates)["high"].max().to_dict()
+            day_lows = session_df.groupby(session_dates)["low"].min().to_dict()
+
+            df[h_col] = dates.map(day_highs).values
+            df[l_col] = dates.map(day_lows).values
 
         return df

@@ -24,14 +24,14 @@ risk:
   max_sl_atr_multiple: 3.0
 
 strategy:
-  liquidity_threshold_pct: 0.02
+  liquidity_threshold_pct: 0.03
   atr_period: 14
   atr_average_period: 50
-  volatility_multiplier: 1.3
+  volatility_multiplier: 0.8
   sweep_wick_body_ratio: 1.5
-  sweep_candle_lookback: 3
-  pullback_candle_limit: 5
-  pivot_lookback: 5
+  sweep_candle_lookback: 5
+  pullback_candle_limit: 10
+  pivot_lookback: 3
   ranging_candle_threshold: 10
   ranging_atr_multiple: 0.7
 
@@ -40,7 +40,7 @@ spread:
     EUR_USD: 1.5
     GBP_USD: 2.0
     GBP_JPY: 3.0
-    XAU_USD: 35.0
+    XAU_USD: 5.0
   spike_multiplier: 3.0
   rolling_average_period: 20
   recheck_interval_seconds: 10
