@@ -57,6 +57,32 @@ class LiquidityEngine:
             "LONDON_LOW": "london_session_low",
         }
 
+        # Also add recent swing highs and lows as zones
+        if "swing_high_price" in df.columns:
+            recent = df.tail(20)
+            for _, row in recent[recent["swing_high_price"].notna()].iterrows():
+                price = float(row["swing_high_price"])
+                swept = self._is_swept(df, price, "SWING_HIGH")
+                zones.append({
+                    "type": "SWING_HIGH",
+                    "price": price,
+                    "strength": 1,
+                    "created_at": ts_now,
+                    "active": not swept,
+                })
+        if "swing_low_price" in df.columns:
+            recent = df.tail(20)
+            for _, row in recent[recent["swing_low_price"].notna()].iterrows():
+                price = float(row["swing_low_price"])
+                swept = self._is_swept(df, price, "SWING_LOW")
+                zones.append({
+                    "type": "SWING_LOW",
+                    "price": price,
+                    "strength": 1,
+                    "created_at": ts_now,
+                    "active": not swept,
+                })
+
         for zone_type, col in zone_map.items():
             if col in df.columns:
                 price = last.get(col)
@@ -113,13 +139,12 @@ class LiquidityEngine:
             return bool(last["low"] < price and last["close"] > price)
 
     def detect_sweep(self, df: pd.DataFrame, zone: dict) -> dict or None:
-        """Check if the most recent candle has swept a given liquidity zone.
+        """Check if recent candles have swept a given liquidity zone.
 
-        A sweep requires all four conditions:
+        A sweep requires:
         1. Wick goes beyond the zone price.
         2. Body closes back inside the zone.
         3. Sweep wick >= sweep_wick_body_ratio * body size.
-        4. Sweep within sweep_candle_lookback candles of zone approach.
 
         Args:
             df: DataFrame with OHLC data.
@@ -129,7 +154,6 @@ class LiquidityEngine:
             Sweep dict if confirmed, None otherwise.
         """
         if df.empty or not zone.get("active", False):
-            self.logger.log("DEBUG", "liquidity", "No sweep: empty df or inactive zone")
             return None
 
         price = zone["price"]
@@ -137,53 +161,42 @@ class LiquidityEngine:
         is_high_zone = "HIGH" in zone_type
 
         lookback = min(self.sweep_candle_lookback, len(df))
-        candidates = df.tail(lookback)
+        tail = df.iloc[-lookback:]
 
-        for idx in candidates.index:
-            candle = df.loc[idx]
-            body_size = abs(candle["close"] - candle["open"])
+        opens = tail["open"].values
+        highs = tail["high"].values
+        lows = tail["low"].values
+        closes = tail["close"].values
+        indices = tail.index.values
+
+        for j in range(len(opens)):
+            body_size = abs(closes[j] - opens[j])
             if body_size == 0:
                 continue
 
             if is_high_zone:
-                wick_beyond = candle["high"] > price
-                body_back = candle["close"] < price
-                sweep_wick = candle["high"] - max(candle["close"], candle["open"])
+                if highs[j] <= price or closes[j] >= price:
+                    continue
+                sweep_wick = highs[j] - max(closes[j], opens[j])
             else:
-                wick_beyond = candle["low"] < price
-                body_back = candle["close"] > price
-                sweep_wick = min(candle["close"], candle["open"]) - candle["low"]
+                if lows[j] >= price or closes[j] <= price:
+                    continue
+                sweep_wick = min(closes[j], opens[j]) - lows[j]
 
-            if not wick_beyond:
-                continue
-            if not body_back:
-                self.logger.log("DEBUG", "liquidity",
-                                "Sweep rejected: body closed beyond zone",
-                                {"zone_type": zone_type, "price": price})
-                continue
             if sweep_wick < self.sweep_wick_body_ratio * body_size:
-                self.logger.log("DEBUG", "liquidity",
-                                "Sweep rejected: wick ratio below threshold",
-                                {"wick": sweep_wick, "body": body_size,
-                                 "ratio": sweep_wick / body_size,
-                                 "threshold": self.sweep_wick_body_ratio})
                 continue
 
             direction = "BULLISH_SWEEP" if not is_high_zone else "BEARISH_SWEEP"
-            sweep_result = {
+            ts_val = tail["timestamp"].iloc[j] if "timestamp" in tail.columns else datetime.now(timezone.utc)
+            return {
                 "zone": zone,
-                "sweep_candle_index": idx,
-                "sweep_high": float(candle["high"]),
-                "sweep_low": float(candle["low"]),
+                "sweep_candle_index": indices[j],
+                "sweep_high": float(highs[j]),
+                "sweep_low": float(lows[j]),
                 "direction": direction,
-                "timestamp": candle.get("timestamp", datetime.now(timezone.utc)),
+                "timestamp": ts_val,
             }
-            self.logger.log("DEBUG", "liquidity", f"Sweep confirmed: {direction}",
-                            {"zone_type": zone_type, "price": price})
-            return sweep_result
 
-        self.logger.log("DEBUG", "liquidity", "No sweep detected",
-                        {"zone_type": zone_type, "price": price})
         return None
 
     def get_active_zones(self, df: pd.DataFrame) -> list:

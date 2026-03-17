@@ -10,3 +10,7 @@ data/circuit_breaker_state.json
 data/test_cb_state.json
 data/open_trades.json
 data/trade_history.json
+
+# Backtest output files
+data/backtest_*.json
+data/backtest_*.csv
