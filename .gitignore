@@ -6,3 +6,7 @@ __pycache__/
 .pytest_cache/
 .coverage
 data/historical/*.db
+data/circuit_breaker_state.json
+data/test_cb_state.json
+data/open_trades.json
+data/trade_history.json
