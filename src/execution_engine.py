@@ -1,9 +1,9 @@
-"""Execution engine module — order execution and fill management."""
+"""Execution engine module — order execution and fill management via MetaTrader 5."""
 
 import time
 from datetime import datetime, timezone
 
-import requests
+import MetaTrader5 as mt5
 
 from src.logger import BotLogger
 
@@ -13,7 +13,7 @@ class ExecutionError(Exception):
 
 
 class ExecutionEngine:
-    """Handles order submission, monitoring, and fill confirmation with OANDA."""
+    """Handles order submission, monitoring, and fill confirmation with MT5."""
 
     def __init__(self, config: dict, logger: BotLogger, data_engine,
                  risk_engine, spread_controller):
@@ -22,7 +22,7 @@ class ExecutionEngine:
         Args:
             config: Full bot configuration dictionary.
             logger: BotLogger instance.
-            data_engine: DataEngine instance for API access.
+            data_engine: DataEngine instance for MT5 access.
             risk_engine: RiskEngine instance for position sizing.
             spread_controller: SpreadController instance for spread/slippage checks.
         """
@@ -34,6 +34,7 @@ class ExecutionEngine:
 
         slippage = config.get("slippage", {})
         self.fill_timeout = slippage.get("fill_confirmation_timeout_seconds", 30)
+        self.default_deviation = 20  # Max price deviation in points
 
     def execute_signal(self, signal: dict) -> dict or None:
         """Execute a trade signal through the full order lifecycle.
@@ -74,284 +75,299 @@ class ExecutionEngine:
 
         # Step 3: Submit limit order
         try:
-            order_id = self.submit_limit_order(
+            result = self.submit_limit_order(
                 instrument, direction, entry_price, stop_loss, tp2, position_size
             )
         except ExecutionError as e:
             self.logger.log_error("execution", f"Order submission failed: {e}")
             return None
 
-        # Step 4: Wait for fill confirmation
-        fill_info = self._wait_for_fill(order_id)
-        if fill_info is None:
-            self.cancel_order(order_id)
-            self.logger.log("WARNING", "execution", "ENTRY_TIMEOUT",
-                            {"order_id": order_id, "instrument": instrument})
-            return None
+        fill_price = result["fill_price"]
+        fill_size = result["fill_size"]
+        trade_id = str(result["order_id"])
 
-        fill_price = fill_info["fill_price"]
-        fill_size = fill_info["fill_size"]
-        trade_id = fill_info.get("trade_id", order_id)
-
-        # Step 5: Check slippage
+        # Step 4: Check slippage
         slip_ok, slip_pips = self.spread_controller.check_slippage(
             instrument, entry_price, fill_price, direction
         )
         if not slip_ok:
-            self.close_trade_at_market(trade_id, "SLIPPAGE_REJECT")
+            self.close_trade_at_market(trade_id, instrument, direction, fill_size, "SLIPPAGE_REJECT")
             self.logger.log("WARNING", "execution", "SLIPPAGE_REJECT",
                             {"instrument": instrument, "slippage_pips": slip_pips,
                              "intended": entry_price, "actual": fill_price})
             return None
 
-        # Step 6: Handle partial fill
+        # Step 5: Handle partial fill
         decision, fill_pct = self.spread_controller.handle_partial_fill(
             position_size, fill_size
         )
         if decision == "REJECT":
-            self.close_trade_at_market(trade_id, "PARTIAL_FILL_REJECT")
+            self.close_trade_at_market(trade_id, instrument, direction, fill_size, "PARTIAL_FILL_REJECT")
             self.logger.log("WARNING", "execution", "PARTIAL_FILL_REJECT",
                             {"instrument": instrument, "fill_pct": fill_pct})
             return None
 
-        # Step 7: Build confirmed trade
+        # Step 6: Build confirmed trade
         confirmed = self.build_confirmed_trade(sized_signal, fill_price, fill_size, trade_id)
         self.logger.log_trade_open(confirmed)
         return confirmed
 
     def submit_limit_order(self, instrument: str, direction: str, price: float,
-                           sl: float, tp: float, size: float) -> str:
-        """Submit a limit order to OANDA.
+                           sl: float, tp: float, size: float) -> dict:
+        """Submit a limit order to MT5.
 
         Args:
-            instrument: OANDA instrument name.
+            instrument: Config instrument name.
             direction: LONG or SHORT.
             price: Limit order price.
             sl: Stop loss price.
             tp: Take profit price.
-            size: Position size in units.
+            size: Position size in lots.
 
         Returns:
-            OANDA order ID as a string.
+            Dict with order_id, fill_price, fill_size.
 
         Raises:
             ExecutionError: If all retries fail.
         """
-        url = (f"{self.data_engine.base_url}/v3/accounts/"
-               f"{self.data_engine.account_id}/orders")
+        mt5_symbol = self.data_engine.to_mt5_symbol(instrument)
 
-        units = size if direction == "LONG" else -size
+        order_type = mt5.ORDER_TYPE_BUY_LIMIT if direction == "LONG" else mt5.ORDER_TYPE_SELL_LIMIT
 
-        body = {
-            "order": {
-                "type": "LIMIT",
-                "instrument": instrument,
-                "units": str(units),
-                "price": str(price),
-                "timeInForce": "GTC",
-                "stopLossOnFill": {"price": str(sl)},
-                "takeProfitOnFill": {"price": str(tp)},
-            }
+        request = {
+            "action": mt5.TRADE_ACTION_PENDING,
+            "symbol": mt5_symbol,
+            "volume": round(size, 2),
+            "type": order_type,
+            "price": price,
+            "sl": sl,
+            "tp": tp,
+            "deviation": self.default_deviation,
+            "magic": 123456,
+            "comment": "fxbot_limit",
+            "type_time": mt5.ORDER_TIME_GTC,
+            "type_filling": mt5.ORDER_FILLING_IOC,
         }
 
         for attempt in range(3):
-            try:
-                response = requests.post(url, headers=self.data_engine.headers,
-                                         json=body, timeout=15)
-                response.raise_for_status()
-                data = response.json()
-                order_id = data.get("orderCreateTransaction", {}).get("id", "")
+            result = mt5.order_send(request)
+            if result is not None and result.retcode == mt5.TRADE_RETCODE_DONE:
                 self.logger.log("INFO", "execution", "Limit order submitted",
-                                {"order_id": order_id, "instrument": instrument,
+                                {"order_id": result.order, "instrument": instrument,
                                  "direction": direction, "price": price, "size": size})
-                return order_id
-            except Exception as e:
-                self.logger.log_error("execution",
-                                      f"Order submit attempt {attempt + 1}/3 failed: {e}")
-                if attempt < 2:
-                    time.sleep(2)
+                return {
+                    "order_id": result.order,
+                    "fill_price": result.price if result.price else price,
+                    "fill_size": size,
+                }
+
+            error_msg = result.comment if result else mt5.last_error()
+            self.logger.log_error("execution",
+                                  f"Order submit attempt {attempt + 1}/3 failed: {error_msg}")
+            if attempt < 2:
+                time.sleep(2)
 
         raise ExecutionError(f"Failed to submit limit order after 3 attempts: {instrument}")
 
     def submit_market_order(self, instrument: str, direction: str,
-                            size: float, reason: str) -> str:
-        """Submit a market order to OANDA.
+                            size: float, sl: float = 0.0, tp: float = 0.0,
+                            reason: str = "") -> dict:
+        """Submit a market order to MT5.
 
         Args:
-            instrument: OANDA instrument name.
+            instrument: Config instrument name.
             direction: LONG or SHORT.
-            size: Position size in units.
+            size: Position size in lots.
+            sl: Stop loss price (0 for none).
+            tp: Take profit price (0 for none).
             reason: Reason for the market order.
 
         Returns:
-            OANDA order ID as a string.
+            Dict with order_id, fill_price, fill_size.
 
         Raises:
             ExecutionError: If all retries fail.
         """
-        url = (f"{self.data_engine.base_url}/v3/accounts/"
-               f"{self.data_engine.account_id}/orders")
+        mt5_symbol = self.data_engine.to_mt5_symbol(instrument)
+        order_type = mt5.ORDER_TYPE_BUY if direction == "LONG" else mt5.ORDER_TYPE_SELL
 
-        units = size if direction == "LONG" else -size
+        # Get current price for the order
+        tick = mt5.symbol_info_tick(mt5_symbol)
+        if tick is None:
+            raise ExecutionError(f"Cannot get tick for {mt5_symbol}")
 
-        body = {
-            "order": {
-                "type": "MARKET",
-                "instrument": instrument,
-                "units": str(units),
-                "timeInForce": "FOK",
-            }
+        price = tick.ask if direction == "LONG" else tick.bid
+
+        request = {
+            "action": mt5.TRADE_ACTION_DEAL,
+            "symbol": mt5_symbol,
+            "volume": round(size, 2),
+            "type": order_type,
+            "price": price,
+            "sl": sl,
+            "tp": tp,
+            "deviation": self.default_deviation,
+            "magic": 123456,
+            "comment": f"fxbot_{reason}",
+            "type_filling": mt5.ORDER_FILLING_IOC,
         }
 
         for attempt in range(3):
-            try:
-                response = requests.post(url, headers=self.data_engine.headers,
-                                         json=body, timeout=15)
-                response.raise_for_status()
-                data = response.json()
-                order_id = data.get("orderCreateTransaction", {}).get("id", "")
+            result = mt5.order_send(request)
+            if result is not None and result.retcode == mt5.TRADE_RETCODE_DONE:
                 self.logger.log("INFO", "execution", "Market order submitted",
-                                {"order_id": order_id, "instrument": instrument,
+                                {"order_id": result.order, "instrument": instrument,
                                  "reason": reason})
-                return order_id
-            except Exception as e:
-                self.logger.log_error("execution",
-                                      f"Market order attempt {attempt + 1}/3 failed: {e}")
-                if attempt < 2:
-                    time.sleep(2)
+                return {
+                    "order_id": result.order,
+                    "fill_price": result.price if result.price else price,
+                    "fill_size": size,
+                }
+
+            error_msg = result.comment if result else mt5.last_error()
+            self.logger.log_error("execution",
+                                  f"Market order attempt {attempt + 1}/3 failed: {error_msg}")
+            if attempt < 2:
+                time.sleep(2)
 
         raise ExecutionError(f"Failed to submit market order after 3 attempts: {instrument}")
 
     def cancel_order(self, order_id: str) -> bool:
-        """Cancel a pending order by ID.
+        """Cancel a pending order by ticket.
 
         Args:
-            order_id: OANDA order ID.
+            order_id: MT5 order ticket as string.
 
         Returns:
             True if cancelled, False if failed.
         """
-        url = (f"{self.data_engine.base_url}/v3/accounts/"
-               f"{self.data_engine.account_id}/orders/{order_id}/cancel")
+        request = {
+            "action": mt5.TRADE_ACTION_REMOVE,
+            "order": int(order_id),
+        }
 
         try:
-            response = requests.put(url, headers=self.data_engine.headers, timeout=15)
-            response.raise_for_status()
-            self.logger.log("INFO", "execution", "Order cancelled",
-                            {"order_id": order_id})
-            return True
+            result = mt5.order_send(request)
+            if result is not None and result.retcode == mt5.TRADE_RETCODE_DONE:
+                self.logger.log("INFO", "execution", "Order cancelled",
+                                {"order_id": order_id})
+                return True
+            error_msg = result.comment if result else mt5.last_error()
+            self.logger.log_error("execution", f"Cancel order failed: {error_msg}",
+                                  {"order_id": order_id})
+            return False
         except Exception as e:
             self.logger.log_error("execution", f"Cancel order failed: {e}",
                                   {"order_id": order_id})
             return False
 
-    def close_trade_at_market(self, trade_id: str, reason: str) -> bool:
-        """Close an open trade immediately at market.
+    def close_trade_at_market(self, trade_id: str, instrument: str,
+                              direction: str, volume: float, reason: str) -> bool:
+        """Close an open trade immediately at market by sending opposite deal.
 
         Args:
-            trade_id: OANDA trade ID.
+            trade_id: MT5 position ticket as string.
+            instrument: Config instrument name.
+            direction: Original trade direction (LONG or SHORT).
+            volume: Volume to close.
             reason: Reason for closing.
 
         Returns:
             True if closed, False if failed.
         """
-        url = (f"{self.data_engine.base_url}/v3/accounts/"
-               f"{self.data_engine.account_id}/trades/{trade_id}/close")
+        mt5_symbol = self.data_engine.to_mt5_symbol(instrument)
+
+        # Close by sending opposite direction
+        close_type = mt5.ORDER_TYPE_SELL if direction == "LONG" else mt5.ORDER_TYPE_BUY
+
+        tick = mt5.symbol_info_tick(mt5_symbol)
+        if tick is None:
+            self.logger.log_error("execution", f"Cannot get tick to close {mt5_symbol}")
+            return False
+
+        price = tick.bid if direction == "LONG" else tick.ask
+
+        request = {
+            "action": mt5.TRADE_ACTION_DEAL,
+            "symbol": mt5_symbol,
+            "volume": round(volume, 2),
+            "type": close_type,
+            "position": int(trade_id),
+            "price": price,
+            "deviation": self.default_deviation,
+            "magic": 123456,
+            "comment": f"fxbot_close_{reason}",
+            "type_filling": mt5.ORDER_FILLING_IOC,
+        }
 
         try:
-            response = requests.put(url, headers=self.data_engine.headers, timeout=15)
-            response.raise_for_status()
-            self.logger.log("INFO", "execution", f"Trade closed: {reason}",
-                            {"trade_id": trade_id, "reason": reason})
-            return True
+            result = mt5.order_send(request)
+            if result is not None and result.retcode == mt5.TRADE_RETCODE_DONE:
+                self.logger.log("INFO", "execution", f"Trade closed: {reason}",
+                                {"trade_id": trade_id, "reason": reason})
+                return True
+            error_msg = result.comment if result else mt5.last_error()
+            self.logger.log_error("execution", f"Close trade failed: {error_msg}",
+                                  {"trade_id": trade_id, "reason": reason})
+            return False
         except Exception as e:
             self.logger.log_error("execution", f"Close trade failed: {e}",
                                   {"trade_id": trade_id, "reason": reason})
             return False
 
-    def get_order_status(self, order_id: str) -> dict:
-        """Fetch order details from OANDA.
+    def modify_trade_sl(self, trade_id: str, instrument: str,
+                        new_sl: float, current_tp: float) -> bool:
+        """Modify the stop loss on an open position via MT5.
 
         Args:
-            order_id: OANDA order ID.
+            trade_id: MT5 position ticket as string.
+            instrument: Config instrument name.
+            new_sl: New stop loss price.
+            current_tp: Current take profit (must be re-sent with SLTP action).
 
         Returns:
-            Dict with state, fill_price, fill_size, fill_time.
+            True if modified, False if failed.
         """
-        url = (f"{self.data_engine.base_url}/v3/accounts/"
-               f"{self.data_engine.account_id}/orders/{order_id}")
+        mt5_symbol = self.data_engine.to_mt5_symbol(instrument)
+
+        request = {
+            "action": mt5.TRADE_ACTION_SLTP,
+            "symbol": mt5_symbol,
+            "position": int(trade_id),
+            "sl": new_sl,
+            "tp": current_tp,
+        }
 
         try:
-            response = requests.get(url, headers=self.data_engine.headers, timeout=15)
-            response.raise_for_status()
-            data = response.json()
-            order = data.get("order", {})
-
-            state = order.get("state", "PENDING")
-            fill_price = float(order.get("filledTime", 0) or 0)
-            fill_size = float(order.get("fillingTransactionID", 0) or 0)
-
-            # Check transactions for fill info
-            if state == "FILLED":
-                txn_id = order.get("fillingTransactionID", "")
-                fill_price = float(order.get("price", 0))
-
-            return {
-                "state": state,
-                "fill_price": fill_price,
-                "fill_size": fill_size,
-                "fill_time": order.get("filledTime"),
-                "trade_id": order.get("tradeOpenedID", order_id),
-            }
+            result = mt5.order_send(request)
+            if result is not None and result.retcode == mt5.TRADE_RETCODE_DONE:
+                self.logger.log("INFO", "execution", "SL modified via MT5",
+                                {"trade_id": trade_id, "new_sl": new_sl})
+                return True
+            error_msg = result.comment if result else mt5.last_error()
+            self.logger.log_error("execution", f"SL modification failed: {error_msg}",
+                                  {"trade_id": trade_id})
+            return False
         except Exception as e:
-            self.logger.log_error("execution", f"Get order status failed: {e}",
-                                  {"order_id": order_id})
-            return {"state": "UNKNOWN", "fill_price": 0, "fill_size": 0, "fill_time": None}
-
-    def _wait_for_fill(self, order_id: str) -> dict or None:
-        """Poll order status until filled or timeout.
-
-        Args:
-            order_id: OANDA order ID.
-
-        Returns:
-            Fill info dict or None if timeout.
-        """
-        elapsed = 0
-        poll_interval = 2
-
-        while elapsed < self.fill_timeout:
-            status = self.get_order_status(order_id)
-
-            if status["state"] == "FILLED":
-                return {
-                    "fill_price": status["fill_price"],
-                    "fill_size": status["fill_size"],
-                    "trade_id": status.get("trade_id", order_id),
-                }
-            elif status["state"] == "CANCELLED":
-                return None
-
-            time.sleep(poll_interval)
-            elapsed += poll_interval
-
-        return None
+            self.logger.log_error("execution", f"SL modification failed: {e}",
+                                  {"trade_id": trade_id})
+            return False
 
     def build_confirmed_trade(self, signal: dict, fill_price: float,
-                              fill_size: float, oanda_trade_id: str) -> dict:
+                              fill_size: float, mt5_trade_id: str) -> dict:
         """Build a confirmed trade dict from signal and fill data.
 
         Args:
             signal: Original trade signal dict.
             fill_price: Actual fill price.
             fill_size: Actual filled size.
-            oanda_trade_id: OANDA trade ID.
+            mt5_trade_id: MT5 position ticket as string.
 
         Returns:
             Immutable trade dict for the trade manager.
         """
         return {
-            "trade_id": oanda_trade_id,
+            "trade_id": mt5_trade_id,
             "instrument": signal["instrument"],
             "direction": signal["direction"],
             "entry_price": fill_price,

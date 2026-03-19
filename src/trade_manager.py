@@ -5,7 +5,6 @@ import os
 from datetime import datetime, timezone
 
 import pandas as pd
-import requests
 
 from src.logger import BotLogger
 
@@ -99,7 +98,7 @@ class TradeManager:
         """Process a price update for all open trades on this instrument.
 
         Args:
-            instrument: OANDA instrument name.
+            instrument: Config instrument name.
             current_price: Current market price.
             df: DataFrame with latest candle data.
         """
@@ -134,7 +133,9 @@ class TradeManager:
             hours_open = (now - entry_time).total_seconds() / 3600
             if hours_open >= self.max_trade_duration_hours:
                 self.execution_engine.close_trade_at_market(
-                    trade["trade_id"], "MAX_DURATION_EXCEEDED")
+                    trade["trade_id"], trade["instrument"],
+                    trade["direction"], trade["position_size"],
+                    "MAX_DURATION_EXCEEDED")
                 self.register_closed_trade(trade["trade_id"], current_price,
                                            "MAX_DURATION_EXCEEDED")
                 return
@@ -144,7 +145,9 @@ class TradeManager:
         # Check volatility collapse
         if self.volatility_engine.is_volatility_collapsing(df):
             self.execution_engine.close_trade_at_market(
-                trade["trade_id"], "VOLATILITY_COLLAPSE")
+                trade["trade_id"], trade["instrument"],
+                trade["direction"], trade["position_size"],
+                "VOLATILITY_COLLAPSE")
             self.register_closed_trade(trade["trade_id"], current_price,
                                        "VOLATILITY_COLLAPSE")
             return
@@ -152,7 +155,9 @@ class TradeManager:
         # Check full close at TP2
         if r >= self.full_close_trigger_r:
             self.execution_engine.close_trade_at_market(
-                trade["trade_id"], "TP2_HIT")
+                trade["trade_id"], trade["instrument"],
+                trade["direction"], trade["position_size"],
+                "TP2_HIT")
             self.register_closed_trade(trade["trade_id"], current_price,
                                        "TP2_HIT")
             return
@@ -160,7 +165,7 @@ class TradeManager:
         # Check partial close at TP1
         if r >= self.partial_close_trigger_r and not trade["partial_closed"]:
             units_to_close = trade["position_size"] * self.partial_close_pct
-            self.partial_close(trade["trade_id"], units_to_close)
+            self.partial_close(trade, units_to_close)
             trade["partial_closed"] = True
             self._persist_open_trades()
             self.logger.log("INFO", "trade_manager", "Partial close executed",
@@ -174,7 +179,7 @@ class TradeManager:
                 new_sl = trade["entry_price"] + spread_buffer
             else:
                 new_sl = trade["entry_price"] - spread_buffer
-            self.modify_trade_sl(trade["trade_id"], new_sl)
+            self.modify_trade_sl(trade, new_sl)
             trade["breakeven_moved"] = True
             trade["stop_loss"] = new_sl
             self._persist_open_trades()
@@ -188,13 +193,13 @@ class TradeManager:
                 if direction == "LONG":
                     new_sl = current_price - (atr * self.trailing_stop_atr_multiple)
                     if new_sl > trade["stop_loss"]:
-                        self.modify_trade_sl(trade["trade_id"], new_sl)
+                        self.modify_trade_sl(trade, new_sl)
                         trade["stop_loss"] = new_sl
                         self._persist_open_trades()
                 else:
                     new_sl = current_price + (atr * self.trailing_stop_atr_multiple)
                     if new_sl < trade["stop_loss"]:
-                        self.modify_trade_sl(trade["trade_id"], new_sl)
+                        self.modify_trade_sl(trade, new_sl)
                         trade["stop_loss"] = new_sl
                         self._persist_open_trades()
 
@@ -211,7 +216,7 @@ class TradeManager:
         """Record a trade closure.
 
         Args:
-            trade_id: OANDA trade ID.
+            trade_id: MT5 position ticket as string.
             close_price: Price at which the trade was closed.
             reason: Reason for closure.
         """
@@ -253,19 +258,16 @@ class TradeManager:
         self._persist_open_trades()
         self._persist_trade_history()
 
-    def modify_trade_sl(self, trade_id: str, new_sl: float):
-        """Modify the stop loss on an open trade via OANDA API.
+    def modify_trade_sl(self, trade: dict, new_sl: float):
+        """Modify the stop loss on an open trade via MT5.
 
         Only allows SL moves that are strictly better (closer to profit).
 
         Args:
-            trade_id: OANDA trade ID.
+            trade: Open trade dict.
             new_sl: New stop loss price.
         """
-        trade = self.open_trades.get(trade_id)
-        if trade is None:
-            return
-
+        trade_id = trade["trade_id"]
         current_sl = trade["stop_loss"]
         direction = trade["direction"]
 
@@ -283,51 +285,21 @@ class TradeManager:
                              "proposed_sl": new_sl})
             return
 
-        url = (f"{self.execution_engine.data_engine.base_url}/v3/accounts/"
-               f"{self.execution_engine.data_engine.account_id}/"
-               f"trades/{trade_id}/orders")
+        current_tp = trade.get("take_profit_2", 0.0)
+        self.execution_engine.modify_trade_sl(
+            trade_id, trade["instrument"], new_sl, current_tp)
 
-        body = {
-            "stopLoss": {"price": str(new_sl)},
-        }
-
-        try:
-            response = requests.put(url,
-                                    headers=self.execution_engine.data_engine.headers,
-                                    json=body, timeout=15)
-            response.raise_for_status()
-            self.logger.log("INFO", "trade_manager", "SL modified",
-                            {"trade_id": trade_id, "old_sl": current_sl,
-                             "new_sl": new_sl})
-        except Exception as e:
-            self.logger.log_error("trade_manager",
-                                  f"SL modification failed: {e}",
-                                  {"trade_id": trade_id})
-
-    def partial_close(self, trade_id: str, units_to_close: float):
-        """Partially close a trade.
+    def partial_close(self, trade: dict, units_to_close: float):
+        """Partially close a trade via MT5.
 
         Args:
-            trade_id: OANDA trade ID.
-            units_to_close: Number of units to close.
+            trade: Open trade dict.
+            units_to_close: Number of lots to close.
         """
-        url = (f"{self.execution_engine.data_engine.base_url}/v3/accounts/"
-               f"{self.execution_engine.data_engine.account_id}/"
-               f"trades/{trade_id}/close")
-
-        body = {"units": str(units_to_close)}
-
-        try:
-            response = requests.put(url,
-                                    headers=self.execution_engine.data_engine.headers,
-                                    json=body, timeout=15)
-            response.raise_for_status()
-            self.logger.log("INFO", "trade_manager", "Partial close executed",
-                            {"trade_id": trade_id, "units_closed": units_to_close})
-        except Exception as e:
-            self.logger.log_error("trade_manager",
-                                  f"Partial close failed: {e}",
-                                  {"trade_id": trade_id})
+        self.execution_engine.close_trade_at_market(
+            trade["trade_id"], trade["instrument"],
+            trade["direction"], units_to_close,
+            "PARTIAL_CLOSE")
 
     def get_open_trades_summary(self) -> list:
         """Return a summary of all open trades.
