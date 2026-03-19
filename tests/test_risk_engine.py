@@ -1,4 +1,4 @@
-"""Unit tests for the RiskEngine module."""
+"""Unit tests for the RiskEngine module (MetaTrader 5)."""
 
 import unittest
 from unittest.mock import MagicMock, patch
@@ -25,9 +25,6 @@ class TestRiskEngine(unittest.TestCase):
         self.config = _make_config()
         self.logger = BotLogger(self.config)
         self.data_engine = MagicMock()
-        self.data_engine.base_url = "https://api-fxpractice.oanda.com"
-        self.data_engine.account_id = "TEST"
-        self.data_engine.headers = {}
         self.re = RiskEngine(self.config, self.logger, self.data_engine)
 
     def test_position_size_within_limits(self):
@@ -81,14 +78,34 @@ class TestRiskEngine(unittest.TestCase):
         self.assertFalse(allowed)
         self.assertEqual(reason, "MONTHLY_LIMIT_HIT")
 
-    def test_get_account_balance_mocked(self):
-        """get_account_balance uses data_engine API."""
-        mock_resp = MagicMock()
-        mock_resp.json.return_value = {"account": {"balance": "50000.00"}}
-        mock_resp.raise_for_status = MagicMock()
-        with patch("src.risk_engine.requests.get", return_value=mock_resp):
-            balance = self.re.get_account_balance()
+    @patch("src.risk_engine.mt5")
+    def test_get_account_balance_from_mt5(self, mock_mt5):
+        """get_account_balance fetches from MT5 account_info."""
+        mock_account = MagicMock()
+        mock_account.balance = 50000.0
+        mock_mt5.account_info.return_value = mock_account
+
+        balance = self.re.get_account_balance()
         self.assertEqual(balance, 50000.0)
+
+    @patch("src.risk_engine.mt5")
+    def test_get_account_balance_uses_cache(self, mock_mt5):
+        """get_account_balance returns cached value within TTL."""
+        self.re._balance_cache = 25000.0
+        self.re._balance_cache_time = 9999999999  # Far future
+
+        balance = self.re.get_account_balance()
+        self.assertEqual(balance, 25000.0)
+        mock_mt5.account_info.assert_not_called()
+
+    @patch("src.risk_engine.mt5")
+    def test_get_account_balance_handles_none(self, mock_mt5):
+        """get_account_balance returns 0.0 when MT5 returns None."""
+        mock_mt5.account_info.return_value = None
+        self.re._balance_cache = None
+
+        balance = self.re.get_account_balance()
+        self.assertEqual(balance, 0.0)
 
     def test_attach_position_size_to_signal(self):
         """attach_position_size_to_signal fills in position_size."""
@@ -106,9 +123,6 @@ class TestRiskEngine(unittest.TestCase):
 
     def test_position_size_jpy_pair(self):
         """Position size calculates correctly for JPY pair."""
-        # 10000 * 0.01 = 100 risk. USD_JPY at 150.00, SL at 149.50
-        # stop_pips = 0.50 * 100 = 50 pips. pip_value = 10/150 = 0.0667
-        # size = 100 / (50 * 0.0667) = 100 / 3.333 = 30.0
         size = self.re.calculate_position_size("USD_JPY", 150.00, 149.50, 10000.0)
         self.assertGreaterEqual(size, 0.01)
         self.assertLessEqual(size, 10.0)

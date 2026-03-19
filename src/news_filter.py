@@ -153,7 +153,7 @@ class NewsFilter:
         """Check if trading is blocked for an instrument due to upcoming news.
 
         Args:
-            instrument: OANDA instrument name (e.g. EUR_USD).
+            instrument: Instrument name (e.g. EUR_USD).
             check_time: Time to check against. Defaults to now UTC.
 
         Returns:
@@ -203,7 +203,7 @@ class NewsFilter:
         """Return the next upcoming high-impact event for this instrument.
 
         Args:
-            instrument: OANDA instrument name.
+            instrument: Instrument name (e.g. EUR_USD).
 
         Returns:
             Event dict or None if no events in the next 24 hours.
@@ -236,7 +236,7 @@ class NewsFilter:
         """Parse an instrument string into its two currencies.
 
         Args:
-            instrument: OANDA instrument name (e.g. EUR_USD, XAU_USD).
+            instrument: Instrument name (e.g. EUR_USD, XAU_USD).
 
         Returns:
             Tuple of (base_currency, quote_currency).

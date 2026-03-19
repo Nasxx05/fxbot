@@ -1,5 +1,6 @@
 """Main entry point for the forex trading bot."""
 
+import json
 import os
 import subprocess
 import sys
@@ -125,6 +126,35 @@ def main():
                 return
 
             df = feature_engine.compute_all(df)
+
+            # Write live spread data for dashboard
+            try:
+                spread_val = data_engine.get_current_spread(instrument)
+                spread_path = os.path.join("data", "live_spreads.json")
+                spreads = {}
+                if os.path.exists(spread_path):
+                    with open(spread_path, "r") as sf:
+                        spreads = json.load(sf)
+                spreads[instrument] = spread_val
+                with open(spread_path, "w") as sf:
+                    json.dump(spreads, sf)
+            except Exception:
+                pass
+
+            # Write live volatility data for dashboard
+            try:
+                vol_state = volatility_engine.get_volatility_state(df)
+                atr_val = volatility_engine.get_atr_value(df)
+                vol_path = os.path.join("data", "live_volatility.json")
+                vols = {}
+                if os.path.exists(vol_path):
+                    with open(vol_path, "r") as vf:
+                        vols = json.load(vf)
+                vols[instrument] = {"regime": vol_state.get("regime", "N/A"), "atr": float(atr_val) if atr_val else 0}
+                with open(vol_path, "w") as vf:
+                    json.dump(vols, vf)
+            except Exception:
+                pass
 
             # Update open trade management
             if not df.empty:

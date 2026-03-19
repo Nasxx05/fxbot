@@ -20,10 +20,35 @@ def load_json(path: str) -> list | dict:
         return []
 
 
+def load_spread_data() -> dict:
+    """Load live spread data written by the bot's main loop."""
+    path = "data/live_spreads.json"
+    if not os.path.exists(path):
+        return {}
+    try:
+        with open(path, "r") as f:
+            return json.load(f)
+    except Exception:
+        return {}
+
+
+def load_volatility_data() -> dict:
+    """Load live volatility data written by the bot's main loop."""
+    path = "data/live_volatility.json"
+    if not os.path.exists(path):
+        return {}
+    try:
+        with open(path, "r") as f:
+            return json.load(f)
+    except Exception:
+        return {}
+
+
 def main():
     """Main dashboard entry point."""
     st.set_page_config(page_title="FX Bot Dashboard", layout="wide")
     st.title("FX Trading Bot Dashboard")
+    st.caption("Broker: MetaTrader 5")
 
     open_trades = load_json("data/open_trades.json")
     if not isinstance(open_trades, list):
@@ -37,7 +62,10 @@ def main():
     if not isinstance(cb_state, dict):
         cb_state = {}
 
-    # ── Panel 1: Status Bar ──
+    spread_data = load_spread_data()
+    volatility_data = load_volatility_data()
+
+    # -- Panel 1: Status Bar --
     st.markdown("---")
     col1, col2, col3, col4 = st.columns(4)
 
@@ -67,7 +95,7 @@ def main():
         consec = cb_state.get("consecutive_losses", 0)
         st.metric("Consec. Losses", consec)
 
-    # ── Panel 2: Open Trades ──
+    # -- Panel 2: Open Trades --
     st.subheader("Open Trades")
     if open_trades:
         rows = []
@@ -88,7 +116,7 @@ def main():
     else:
         st.info("No open trades.")
 
-    # ── Panel 3: Today's Performance ──
+    # -- Panel 3: Today's Performance --
     st.subheader("Today's Performance")
     today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
     today_trades = [t for t in trade_history
@@ -106,7 +134,7 @@ def main():
     with col3:
         st.metric("PnL (pips)", f"{pnl_today:+.1f}")
 
-    # ── Panel 4: Equity Curve ──
+    # -- Panel 4: Equity Curve --
     st.subheader("Equity Curve")
     if trade_history:
         balance = 10000.0
@@ -128,19 +156,35 @@ def main():
     else:
         st.info("No trade history yet.")
 
-    # ── Panel 5: Live Spread Monitor ──
+    # -- Panel 5: Live Spread Monitor --
     st.subheader("Spread Monitor")
     instruments = ["EUR_USD", "GBP_USD", "GBP_JPY", "XAU_USD"]
     spread_cols = st.columns(len(instruments))
     for i, inst in enumerate(instruments):
         with spread_cols[i]:
-            st.metric(inst.replace("_", "/"), "-- pips")
+            spread_val = spread_data.get(inst)
+            if spread_val is not None:
+                st.metric(inst.replace("_", "/"), f"{spread_val:.1f} pips")
+            else:
+                st.metric(inst.replace("_", "/"), "-- pips")
 
-    # ── Panel 6: Volatility Status ──
+    # -- Panel 6: Volatility Status --
     st.subheader("Volatility Status")
-    st.info("Connect to live data for real-time volatility monitoring.")
+    if volatility_data:
+        vol_cols = st.columns(len(instruments))
+        for i, inst in enumerate(instruments):
+            with vol_cols[i]:
+                vol_info = volatility_data.get(inst, {})
+                regime = vol_info.get("regime", "N/A")
+                atr = vol_info.get("atr", 0)
+                color = {"TRENDING": "🟢", "RANGING": "🔴", "EXPANDING": "🟡"}.get(regime, "⚪")
+                st.metric(inst.replace("_", "/"), f"{color} {regime}")
+                if atr > 0:
+                    st.caption(f"ATR: {atr:.5f}")
+    else:
+        st.info("Volatility data updates when the bot is running.")
 
-    # ── Panel 7: Recent Signals ──
+    # -- Panel 7: Recent Signals --
     st.subheader("Recent Trade History")
     if trade_history:
         recent = trade_history[-20:]
@@ -159,7 +203,7 @@ def main():
     else:
         st.info("No recent signals.")
 
-    # ── Panel 8: Circuit Breaker Status ──
+    # -- Panel 8: Circuit Breaker Status --
     st.subheader("Circuit Breaker Status")
     breaker_cols = st.columns(4)
     breakers = [

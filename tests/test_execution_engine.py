@@ -1,4 +1,4 @@
-"""Unit tests for the ExecutionEngine module."""
+"""Unit tests for the ExecutionEngine module (MetaTrader 5)."""
 
 import unittest
 from unittest.mock import MagicMock, patch
@@ -45,9 +45,7 @@ class TestExecutionEngine(unittest.TestCase):
         self.config = _make_config()
         self.logger = BotLogger(self.config)
         self.data_engine = MagicMock()
-        self.data_engine.base_url = "https://api-fxpractice.oanda.com"
-        self.data_engine.account_id = "TEST"
-        self.data_engine.headers = {}
+        self.data_engine.to_mt5_symbol.side_effect = lambda x: x.replace("_", "")
         self.risk_engine = MagicMock()
         self.spread_controller = MagicMock()
 
@@ -61,88 +59,80 @@ class TestExecutionEngine(unittest.TestCase):
         result = self.ee.execute_signal(_make_signal())
         self.assertIsNone(result)
 
-    def test_execute_signal_fill_timeout(self):
-        """execute_signal returns None when fill timeout is exceeded."""
+    def test_execute_signal_blocked_by_sizing(self):
+        """execute_signal returns None when position sizing fails."""
         self.spread_controller.check_spread.return_value = (True, 1.0, None)
-        self.risk_engine.attach_position_size_to_signal.return_value = _make_signal()
-
-        mock_resp = MagicMock()
-        mock_resp.json.return_value = {"orderCreateTransaction": {"id": "123"}}
-        mock_resp.raise_for_status = MagicMock()
-
-        with patch("src.execution_engine.requests.post", return_value=mock_resp):
-            # Override fill timeout to 0 so it times out immediately
-            self.ee.fill_timeout = 0
-            cancel_resp = MagicMock()
-            cancel_resp.raise_for_status = MagicMock()
-            with patch("src.execution_engine.requests.put", return_value=cancel_resp):
-                result = self.ee.execute_signal(_make_signal())
-
+        self.risk_engine.attach_position_size_to_signal.return_value = None
+        result = self.ee.execute_signal(_make_signal())
         self.assertIsNone(result)
 
-    def test_execute_signal_slippage_reject(self):
+    @patch("src.execution_engine.mt5")
+    def test_execute_signal_slippage_reject(self, mock_mt5):
         """execute_signal returns None when slippage exceeds threshold."""
         self.spread_controller.check_spread.return_value = (True, 1.0, None)
         self.risk_engine.attach_position_size_to_signal.return_value = _make_signal()
         self.spread_controller.check_slippage.return_value = (False, 5.0)
-        self.spread_controller.handle_partial_fill.return_value = ("ACCEPT", 1.0)
 
-        # Mock submit and fill
-        mock_post = MagicMock()
-        mock_post.json.return_value = {"orderCreateTransaction": {"id": "123"}}
-        mock_post.raise_for_status = MagicMock()
+        # Mock successful order send
+        mock_result = MagicMock()
+        mock_result.retcode = 10009  # TRADE_RETCODE_DONE
+        mock_result.order = 12345
+        mock_result.price = 1.2100
+        mock_mt5.order_send.return_value = mock_result
+        mock_mt5.TRADE_RETCODE_DONE = 10009
+        mock_mt5.ORDER_TYPE_SELL_LIMIT = 3
+        mock_mt5.ORDER_TYPE_SELL = 1
+        mock_mt5.ORDER_TYPE_BUY = 0
+        mock_mt5.TRADE_ACTION_PENDING = 5
+        mock_mt5.TRADE_ACTION_DEAL = 1
+        mock_mt5.ORDER_TIME_GTC = 2
+        mock_mt5.ORDER_FILLING_IOC = 1
 
-        mock_get = MagicMock()
-        mock_get.json.return_value = {"order": {
-            "state": "FILLED", "price": "1.2110",
-            "fillingTransactionID": "124", "tradeOpenedID": "125",
-            "filledTime": "2024-01-15T10:00:01Z"
-        }}
-        mock_get.raise_for_status = MagicMock()
+        # Mock tick for close
+        mock_tick = MagicMock()
+        mock_tick.bid = 1.2100
+        mock_tick.ask = 1.2101
+        mock_mt5.symbol_info_tick.return_value = mock_tick
 
-        mock_put = MagicMock()
-        mock_put.raise_for_status = MagicMock()
-
-        with patch("src.execution_engine.requests.post", return_value=mock_post):
-            with patch("src.execution_engine.requests.get", return_value=mock_get):
-                with patch("src.execution_engine.requests.put", return_value=mock_put):
-                    result = self.ee.execute_signal(_make_signal())
-
+        result = self.ee.execute_signal(_make_signal())
         self.assertIsNone(result)
 
-    def test_execute_signal_partial_fill_reject(self):
+    @patch("src.execution_engine.mt5")
+    def test_execute_signal_partial_fill_reject(self, mock_mt5):
         """execute_signal returns None when partial fill is below 80%."""
         self.spread_controller.check_spread.return_value = (True, 1.0, None)
         self.risk_engine.attach_position_size_to_signal.return_value = _make_signal()
         self.spread_controller.check_slippage.return_value = (True, 0.5)
         self.spread_controller.handle_partial_fill.return_value = ("REJECT", 0.50)
 
-        mock_post = MagicMock()
-        mock_post.json.return_value = {"orderCreateTransaction": {"id": "123"}}
-        mock_post.raise_for_status = MagicMock()
+        # Mock successful order send
+        mock_result = MagicMock()
+        mock_result.retcode = 10009
+        mock_result.order = 12345
+        mock_result.price = 1.2100
+        mock_mt5.order_send.return_value = mock_result
+        mock_mt5.TRADE_RETCODE_DONE = 10009
+        mock_mt5.ORDER_TYPE_SELL_LIMIT = 3
+        mock_mt5.ORDER_TYPE_SELL = 1
+        mock_mt5.ORDER_TYPE_BUY = 0
+        mock_mt5.TRADE_ACTION_PENDING = 5
+        mock_mt5.TRADE_ACTION_DEAL = 1
+        mock_mt5.ORDER_TIME_GTC = 2
+        mock_mt5.ORDER_FILLING_IOC = 1
 
-        mock_get = MagicMock()
-        mock_get.json.return_value = {"order": {
-            "state": "FILLED", "price": "1.2100",
-            "fillingTransactionID": "124", "tradeOpenedID": "125",
-            "filledTime": "2024-01-15T10:00:01Z"
-        }}
-        mock_get.raise_for_status = MagicMock()
+        # Mock tick for close
+        mock_tick = MagicMock()
+        mock_tick.bid = 1.2100
+        mock_tick.ask = 1.2101
+        mock_mt5.symbol_info_tick.return_value = mock_tick
 
-        mock_put = MagicMock()
-        mock_put.raise_for_status = MagicMock()
-
-        with patch("src.execution_engine.requests.post", return_value=mock_post):
-            with patch("src.execution_engine.requests.get", return_value=mock_get):
-                with patch("src.execution_engine.requests.put", return_value=mock_put):
-                    result = self.ee.execute_signal(_make_signal())
-
+        result = self.ee.execute_signal(_make_signal())
         self.assertIsNone(result)
 
     def test_build_confirmed_trade_has_all_keys(self):
         """build_confirmed_trade returns dict with all required keys."""
         signal = _make_signal()
-        trade = self.ee.build_confirmed_trade(signal, 1.2100, 0.50, "OANDA_123")
+        trade = self.ee.build_confirmed_trade(signal, 1.2100, 0.50, "MT5_123")
 
         required_keys = [
             "trade_id", "instrument", "direction", "entry_price",
@@ -158,21 +148,101 @@ class TestExecutionEngine(unittest.TestCase):
         self.assertFalse(trade["partial_closed"])
         self.assertEqual(trade["r_multiple_current"], 0.0)
 
-    def test_cancel_order_success(self):
+    @patch("src.execution_engine.mt5")
+    def test_cancel_order_success(self, mock_mt5):
         """cancel_order returns True on success."""
-        mock_resp = MagicMock()
-        mock_resp.raise_for_status = MagicMock()
-        with patch("src.execution_engine.requests.put", return_value=mock_resp):
-            result = self.ee.cancel_order("123")
+        mock_result = MagicMock()
+        mock_result.retcode = 10009
+        mock_mt5.order_send.return_value = mock_result
+        mock_mt5.TRADE_RETCODE_DONE = 10009
+        mock_mt5.TRADE_ACTION_REMOVE = 8
+
+        result = self.ee.cancel_order("123")
         self.assertTrue(result)
 
-    def test_close_trade_at_market_success(self):
+    @patch("src.execution_engine.mt5")
+    def test_cancel_order_failure(self, mock_mt5):
+        """cancel_order returns False on failure."""
+        mock_result = MagicMock()
+        mock_result.retcode = 10013
+        mock_result.comment = "Invalid order"
+        mock_mt5.order_send.return_value = mock_result
+        mock_mt5.TRADE_RETCODE_DONE = 10009
+        mock_mt5.TRADE_ACTION_REMOVE = 8
+
+        result = self.ee.cancel_order("123")
+        self.assertFalse(result)
+
+    @patch("src.execution_engine.mt5")
+    def test_close_trade_at_market_success(self, mock_mt5):
         """close_trade_at_market returns True on success."""
-        mock_resp = MagicMock()
-        mock_resp.raise_for_status = MagicMock()
-        with patch("src.execution_engine.requests.put", return_value=mock_resp):
-            result = self.ee.close_trade_at_market("123", "TEST")
+        mock_tick = MagicMock()
+        mock_tick.bid = 1.2100
+        mock_tick.ask = 1.2101
+        mock_mt5.symbol_info_tick.return_value = mock_tick
+
+        mock_result = MagicMock()
+        mock_result.retcode = 10009
+        mock_mt5.order_send.return_value = mock_result
+        mock_mt5.TRADE_RETCODE_DONE = 10009
+        mock_mt5.ORDER_TYPE_SELL = 1
+        mock_mt5.TRADE_ACTION_DEAL = 1
+        mock_mt5.ORDER_FILLING_IOC = 1
+
+        result = self.ee.close_trade_at_market("123", "EUR_USD", "LONG", 0.10, "TEST")
         self.assertTrue(result)
+
+    @patch("src.execution_engine.mt5")
+    def test_modify_trade_sl_success(self, mock_mt5):
+        """modify_trade_sl returns True on success."""
+        mock_result = MagicMock()
+        mock_result.retcode = 10009
+        mock_mt5.order_send.return_value = mock_result
+        mock_mt5.TRADE_RETCODE_DONE = 10009
+        mock_mt5.TRADE_ACTION_SLTP = 6
+
+        result = self.ee.modify_trade_sl("123", "EUR_USD", 1.2050, 1.1950)
+        self.assertTrue(result)
+
+    @patch("src.execution_engine.mt5")
+    def test_submit_limit_order_retries_on_failure(self, mock_mt5):
+        """submit_limit_order raises ExecutionError after 3 failures."""
+        mock_result = MagicMock()
+        mock_result.retcode = 10013
+        mock_result.comment = "Rejected"
+        mock_mt5.order_send.return_value = mock_result
+        mock_mt5.TRADE_RETCODE_DONE = 10009
+        mock_mt5.ORDER_TYPE_BUY_LIMIT = 2
+        mock_mt5.TRADE_ACTION_PENDING = 5
+        mock_mt5.ORDER_TIME_GTC = 2
+        mock_mt5.ORDER_FILLING_IOC = 1
+
+        with self.assertRaises(ExecutionError):
+            self.ee.submit_limit_order("EUR_USD", "LONG", 1.1000, 1.0950, 1.1100, 0.10)
+
+        self.assertEqual(mock_mt5.order_send.call_count, 3)
+
+    @patch("src.execution_engine.mt5")
+    def test_submit_market_order_success(self, mock_mt5):
+        """submit_market_order returns dict on success."""
+        mock_tick = MagicMock()
+        mock_tick.ask = 1.1001
+        mock_tick.bid = 1.1000
+        mock_mt5.symbol_info_tick.return_value = mock_tick
+
+        mock_result = MagicMock()
+        mock_result.retcode = 10009
+        mock_result.order = 99999
+        mock_result.price = 1.1001
+        mock_mt5.order_send.return_value = mock_result
+        mock_mt5.TRADE_RETCODE_DONE = 10009
+        mock_mt5.ORDER_TYPE_BUY = 0
+        mock_mt5.TRADE_ACTION_DEAL = 1
+        mock_mt5.ORDER_FILLING_IOC = 1
+
+        result = self.ee.submit_market_order("EUR_USD", "LONG", 0.10, reason="TEST")
+        self.assertEqual(result["order_id"], 99999)
+        self.assertEqual(result["fill_price"], 1.1001)
 
 
 if __name__ == "__main__":
