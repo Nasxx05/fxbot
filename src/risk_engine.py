@@ -3,7 +3,7 @@
 import math
 import time
 
-import requests
+import MetaTrader5 as mt5
 
 from src.logger import BotLogger
 
@@ -17,7 +17,7 @@ class RiskEngine:
         Args:
             config: Full bot configuration dictionary.
             logger: BotLogger instance.
-            data_engine: DataEngine instance for API access.
+            data_engine: DataEngine instance for MT5 access.
         """
         self.config = config
         self.logger = logger
@@ -38,7 +38,7 @@ class RiskEngine:
         """Calculate position size in lots based on risk parameters.
 
         Args:
-            instrument: OANDA instrument name.
+            instrument: Config instrument name.
             entry_price: Intended entry price.
             stop_loss: Stop loss price.
             account_balance: Current account balance.
@@ -96,7 +96,7 @@ class RiskEngine:
         """Get pip value in USD per standard lot.
 
         Args:
-            instrument: OANDA instrument name.
+            instrument: Config instrument name.
             price: Current price of the instrument.
 
         Returns:
@@ -118,7 +118,7 @@ class RiskEngine:
             return 10.0
 
     def get_account_balance(self) -> float:
-        """Fetch current account balance from OANDA, cached for 60 seconds.
+        """Fetch current account balance from MT5, cached for 60 seconds.
 
         Returns:
             Account balance as a float.
@@ -128,14 +128,16 @@ class RiskEngine:
                 now - self._balance_cache_time < self._balance_cache_ttl):
             return self._balance_cache
 
-        url = (f"{self.data_engine.base_url}/v3/accounts/"
-               f"{self.data_engine.account_id}/summary")
-
         try:
-            response = requests.get(url, headers=self.data_engine.headers, timeout=15)
-            response.raise_for_status()
-            data = response.json()
-            balance = float(data["account"]["balance"])
+            account_info = mt5.account_info()
+            if account_info is None:
+                self.logger.log_error("risk_engine",
+                                      "Failed to fetch MT5 account info")
+                if self._balance_cache is not None:
+                    return self._balance_cache
+                return 0.0
+
+            balance = account_info.balance
             self._balance_cache = balance
             self._balance_cache_time = now
             self.logger.log("DEBUG", "risk_engine",

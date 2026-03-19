@@ -35,7 +35,7 @@ def main():
         config = yaml.safe_load(f)
 
     logger = BotLogger(config)
-    logger.log("INFO", "main", "Starting Forex Bot...")
+    logger.log("INFO", "main", "Starting Forex Bot (MetaTrader 5)...")
 
     # 1. Initialize all modules in dependency order
     data_engine = DataEngine(config)
@@ -154,9 +154,10 @@ def main():
             alert_system.alert_bot_error(str(e), "on_new_candle")
 
     # 8. Start main trading loop with restart on error
-    logger.log("INFO", "main", "Starting main trading loop...")
+    logger.log("INFO", "main", "Starting main trading loop (MT5 polling)...")
     print(f"Forex Bot started — monitoring {instruments}")
     print(f"Mode: {config.get('broker', {}).get('environment', 'demo').upper()}")
+    print("Broker: MetaTrader 5")
     print("Press Ctrl+C to stop.")
 
     while True:
@@ -165,6 +166,7 @@ def main():
         except KeyboardInterrupt:
             logger.log("INFO", "main", "Shutdown requested by user")
             print("\nShutting down gracefully...")
+            data_engine.shutdown()
             alert_system.send("*BOT OFFLINE* — Manual shutdown")
             break
         except Exception as e:

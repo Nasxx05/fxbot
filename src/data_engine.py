@@ -1,21 +1,29 @@
-"""Data engine module — connects to OANDA v20 API, fetches and streams candle data."""
+"""Data engine module — connects to MetaTrader 5 terminal, fetches and polls candle data."""
 
 import os
 import sqlite3
 import time
 from datetime import datetime, timezone
 
+import MetaTrader5 as mt5
+import numpy as np
 import pandas as pd
-import requests
 from dotenv import load_dotenv
 
 from src.logger import BotLogger
 
 load_dotenv()
 
+# MT5 timeframe mapping
+MT5_TIMEFRAMES = {
+    "M15": mt5.TIMEFRAME_M15,
+    "H1": mt5.TIMEFRAME_H1,
+    "H4": mt5.TIMEFRAME_H4,
+}
+
 
 class DataEngine:
-    """Handles all data operations: OANDA API communication, candle storage, and streaming."""
+    """Handles all data operations: MT5 connection, candle fetching, and polling."""
 
     def __init__(self, config: dict):
         """Initialize the DataEngine with configuration.
@@ -26,26 +34,53 @@ class DataEngine:
         self.config = config
         self.logger = BotLogger(config)
 
-        self.api_key = os.environ.get("OANDA_API_KEY", "")
-        self.account_id = os.environ.get("OANDA_ACCOUNT_ID", "")
+        # Initialize MT5 connection
+        login = os.environ.get("MT5_LOGIN", "")
+        password = os.environ.get("MT5_PASSWORD", "")
+        server = os.environ.get("MT5_SERVER", "")
 
-        broker_config = config.get("broker", {})
-        env = broker_config.get("environment", "demo")
-        if env == "live":
-            self.base_url = broker_config.get("base_url_live", "https://api-fxtrade.oanda.com")
-            self.stream_url = "https://stream-fxtrade.oanda.com"
-        else:
-            self.base_url = broker_config.get("base_url_demo", "https://api-fxpractice.oanda.com")
-            self.stream_url = "https://stream-fxpractice.oanda.com"
+        init_kwargs = {}
+        if login:
+            init_kwargs["login"] = int(login)
+        if password:
+            init_kwargs["password"] = password
+        if server:
+            init_kwargs["server"] = server
 
-        self.headers = {
-            "Authorization": f"Bearer {self.api_key}",
-            "Content-Type": "application/json",
-        }
+        if not mt5.initialize(**init_kwargs):
+            error = mt5.last_error()
+            raise RuntimeError(
+                f"MT5 initialize failed: {error}. "
+                "Make sure MetaTrader 5 terminal is open and logged in."
+            )
+
+        account_info = mt5.account_info()
+        if account_info is None:
+            raise RuntimeError("MT5: Could not retrieve account info. Check login credentials.")
+
+        self.logger.log("INFO", "data_engine",
+                        f"MT5 connected — Account #{account_info.login} "
+                        f"on {account_info.server}")
 
         self.db_path = os.path.join("data", "historical", "candles.db")
         os.makedirs(os.path.dirname(self.db_path), exist_ok=True)
         self._init_db()
+
+    @staticmethod
+    def to_mt5_symbol(instrument: str) -> str:
+        """Convert config instrument name to MT5 symbol.
+
+        EUR_USD -> EURUSD, XAU_USD -> XAUUSD
+        """
+        return instrument.replace("_", "")
+
+    @staticmethod
+    def from_mt5_symbol(symbol: str) -> str:
+        """Convert MT5 symbol back to config instrument name.
+
+        EURUSD -> EUR_USD, XAUUSD -> XAU_USD
+        """
+        return symbol[:3] + "_" + symbol[3:]
 
     def _init_db(self):
         """Create the candles table and indexes if they do not exist."""
@@ -95,10 +130,10 @@ class DataEngine:
         return True
 
     def fetch_historical_candles(self, instrument: str, timeframe: str, count: int) -> pd.DataFrame:
-        """Fetch historical candles from OANDA v20 REST API.
+        """Fetch historical candles from MetaTrader 5.
 
         Args:
-            instrument: OANDA instrument name (e.g. EUR_USD).
+            instrument: Config instrument name (e.g. EUR_USD).
             timeframe: Candle granularity (e.g. M15, H1, H4).
             count: Number of candles to fetch.
 
@@ -106,48 +141,45 @@ class DataEngine:
             DataFrame with columns: timestamp, open, high, low, close, volume,
             sorted by timestamp ascending.
         """
-        url = f"{self.base_url}/v3/instruments/{instrument}/candles"
-        params = {
-            "count": count,
-            "granularity": timeframe,
-            "price": "MBA",
-        }
+        mt5_symbol = self.to_mt5_symbol(instrument)
+        mt5_tf = MT5_TIMEFRAMES.get(timeframe)
+        if mt5_tf is None:
+            self.logger.log_error("data_engine", f"Unknown timeframe: {timeframe}")
+            return pd.DataFrame(columns=["timestamp", "open", "high", "low", "close", "volume"])
 
-        max_retries = 3
-        for attempt in range(max_retries):
-            try:
-                response = requests.get(url, headers=self.headers, params=params, timeout=30)
-                response.raise_for_status()
-                data = response.json()
-                break
-            except Exception as e:
-                self.logger.log_error(
-                    "data_engine",
-                    f"API call failed (attempt {attempt + 1}/{max_retries}): {e}",
-                    {"instrument": instrument, "timeframe": timeframe},
-                )
-                if attempt < max_retries - 1:
-                    time.sleep(2)
-                else:
-                    return pd.DataFrame(columns=["timestamp", "open", "high", "low", "close", "volume"])
+        # Ensure symbol is available in Market Watch
+        if not mt5.symbol_select(mt5_symbol, True):
+            self.logger.log_error("data_engine", f"Symbol {mt5_symbol} not available in MT5")
+            return pd.DataFrame(columns=["timestamp", "open", "high", "low", "close", "volume"])
 
-        candles = []
-        for c in data.get("candles", []):
-            if not c.get("complete", False):
-                continue
-            mid = c.get("mid", {})
-            row = {
-                "timestamp": c["time"],
-                "open": float(mid.get("o", 0)),
-                "high": float(mid.get("h", 0)),
-                "low": float(mid.get("l", 0)),
-                "close": float(mid.get("c", 0)),
-                "volume": int(c.get("volume", 0)),
-            }
-            if self._validate_candle(row):
-                candles.append(row)
+        rates = mt5.copy_rates_from_pos(mt5_symbol, mt5_tf, 0, count)
+        if rates is None or len(rates) == 0:
+            error = mt5.last_error()
+            self.logger.log_error("data_engine",
+                                  f"MT5 copy_rates failed: {error}",
+                                  {"instrument": instrument, "timeframe": timeframe})
+            return pd.DataFrame(columns=["timestamp", "open", "high", "low", "close", "volume"])
 
-        df = pd.DataFrame(candles)
+        # Convert numpy structured array to DataFrame
+        df = pd.DataFrame(rates)
+        df["timestamp"] = pd.to_datetime(df["time"], unit="s", utc=True)
+        df = df.rename(columns={
+            "tick_volume": "volume",
+        })
+        df = df[["timestamp", "open", "high", "low", "close", "volume"]]
+
+        # Remove the last (incomplete) candle
+        if len(df) > 1:
+            df = df.iloc[:-1]
+
+        # Validate candles
+        valid_rows = []
+        for _, row in df.iterrows():
+            row_dict = row.to_dict()
+            if self._validate_candle(row_dict):
+                valid_rows.append(row_dict)
+
+        df = pd.DataFrame(valid_rows)
         if df.empty:
             return pd.DataFrame(columns=["timestamp", "open", "high", "low", "close", "volume"])
 
@@ -155,14 +187,13 @@ class DataEngine:
         df = df.sort_values("timestamp").reset_index(drop=True)
 
         self._store_candles(instrument, timeframe, df)
-
         return df
 
     def _store_candles(self, instrument: str, timeframe: str, df: pd.DataFrame):
         """Store validated candles into SQLite, skipping duplicates.
 
         Args:
-            instrument: OANDA instrument name.
+            instrument: Config instrument name.
             timeframe: Candle granularity.
             df: DataFrame of candles to store.
         """
@@ -199,7 +230,7 @@ class DataEngine:
         """Query the most recent N candles from SQLite.
 
         Args:
-            instrument: OANDA instrument name.
+            instrument: Config instrument name.
             timeframe: Candle granularity.
             limit: Maximum number of candles to return.
 
@@ -227,43 +258,41 @@ class DataEngine:
         """Get the current spread in pips for an instrument.
 
         Args:
-            instrument: OANDA instrument name.
+            instrument: Config instrument name.
 
         Returns:
             Spread as a positive float in pips.
         """
-        url = f"{self.base_url}/v3/accounts/{self.account_id}/pricing"
-        params = {"instruments": instrument}
+        mt5_symbol = self.to_mt5_symbol(instrument)
 
         try:
-            response = requests.get(url, headers=self.headers, params=params, timeout=15)
-            response.raise_for_status()
-            data = response.json()
-
-            prices = data.get("prices", [])
-            if not prices:
-                self.logger.log_error("data_engine", f"No pricing data for {instrument}")
+            info = mt5.symbol_info(mt5_symbol)
+            if info is None:
+                self.logger.log_error("data_engine", f"No symbol info for {mt5_symbol}")
                 return 0.0
 
-            price = prices[0]
-            bid = float(price["bids"][0]["price"])
-            ask = float(price["asks"][0]["price"])
+            spread_points = info.spread
 
-            return self._calculate_spread_pips(instrument, bid, ask)
+            # Convert points to pips
+            # For JPY pairs: 1 point = 1 pip (3-digit pricing)
+            # For most pairs: 1 pip = 10 points (5-digit pricing)
+            # For XAU_USD: 1 pip = 10 points
+            if "JPY" in instrument:
+                return spread_points / 10.0
+            else:
+                return spread_points / 10.0
 
         except Exception as e:
-            self.logger.log_error(
-                "data_engine",
-                f"Spread fetch error: {e}",
-                {"instrument": instrument},
-            )
+            self.logger.log_error("data_engine",
+                                  f"Spread fetch error: {e}",
+                                  {"instrument": instrument})
             return 0.0
 
     def _calculate_spread_pips(self, instrument: str, bid: float, ask: float) -> float:
         """Calculate spread in pips based on instrument type.
 
         Args:
-            instrument: OANDA instrument name.
+            instrument: Config instrument name.
             bid: Current bid price.
             ask: Current ask price.
 
@@ -282,110 +311,111 @@ class DataEngine:
         """Get the current bid and ask prices for an instrument.
 
         Args:
-            instrument: OANDA instrument name.
+            instrument: Config instrument name.
 
         Returns:
             Tuple of (bid, ask) as floats.
         """
-        url = f"{self.base_url}/v3/accounts/{self.account_id}/pricing"
-        params = {"instruments": instrument}
+        mt5_symbol = self.to_mt5_symbol(instrument)
 
         try:
-            response = requests.get(url, headers=self.headers, params=params, timeout=15)
-            response.raise_for_status()
-            data = response.json()
-
-            prices = data.get("prices", [])
-            if not prices:
-                self.logger.log_error("data_engine", f"No pricing data for {instrument}")
+            tick = mt5.symbol_info_tick(mt5_symbol)
+            if tick is None:
+                self.logger.log_error("data_engine", f"No tick data for {mt5_symbol}")
                 return (0.0, 0.0)
 
-            price = prices[0]
-            bid = float(price["bids"][0]["price"])
-            ask = float(price["asks"][0]["price"])
-            return (bid, ask)
+            return (tick.bid, tick.ask)
 
         except Exception as e:
-            self.logger.log_error(
-                "data_engine",
-                f"Bid/ask fetch error: {e}",
-                {"instrument": instrument},
-            )
+            self.logger.log_error("data_engine",
+                                  f"Bid/ask fetch error: {e}",
+                                  {"instrument": instrument})
             return (0.0, 0.0)
 
     def stream_candles(self, instruments: list, callback: callable):
-        """Open a streaming connection to OANDA for real-time pricing.
+        """Poll for new M15 candle completions by checking every 5 seconds.
 
-        Detects when a new M15 candle completes and calls the callback.
+        MT5 does not have a push streaming API, so we poll the last 2 candles
+        and detect when a new completed candle appears.
 
         Args:
-            instruments: List of OANDA instrument names.
+            instruments: List of config instrument names.
             callback: Function to call with (instrument, candle_data) when a candle completes.
         """
-        url = f"{self.stream_url}/v3/accounts/{self.account_id}/pricing/stream"
-        params = {"instruments": ",".join(instruments)}
+        self.logger.log("INFO", "data_engine",
+                        "Starting candle polling loop",
+                        {"instruments": instruments, "poll_interval": 5})
 
-        reconnect_delay = 5
-        current_candle_times = {}
+        last_seen_candle_times = {}
 
         while True:
-            try:
-                self.logger.log("INFO", "data_engine", "Opening streaming connection", {"instruments": instruments})
-                response = requests.get(url, headers=self.headers, params=params, stream=True, timeout=None)
-                response.raise_for_status()
+            for instrument in instruments:
+                try:
+                    mt5_symbol = self.to_mt5_symbol(instrument)
+                    mt5_tf = MT5_TIMEFRAMES.get("M15", mt5.TIMEFRAME_M15)
 
-                reconnect_delay = 5
-
-                for line in response.iter_lines():
-                    if not line:
+                    rates = mt5.copy_rates_from_pos(mt5_symbol, mt5_tf, 0, 2)
+                    if rates is None or len(rates) < 2:
                         continue
 
-                    import json
-                    try:
-                        tick = json.loads(line.decode("utf-8"))
-                    except (json.JSONDecodeError, UnicodeDecodeError):
+                    # The second-to-last candle is the most recent completed one
+                    completed_candle = rates[-2]
+                    candle_time = pd.Timestamp(completed_candle["time"], unit="s", tz="UTC")
+
+                    prev_time = last_seen_candle_times.get(instrument)
+                    if prev_time is None:
+                        last_seen_candle_times[instrument] = candle_time
                         continue
 
-                    if tick.get("type") != "PRICE":
-                        continue
-
-                    instrument = tick.get("instrument")
-                    tick_time = pd.to_datetime(tick.get("time"), utc=True)
-
-                    candle_open_time = tick_time.floor("15min")
-
-                    prev_candle_time = current_candle_times.get(instrument)
-                    if prev_candle_time and candle_open_time > prev_candle_time:
+                    if candle_time > prev_time:
+                        last_seen_candle_times[instrument] = candle_time
                         candle_data = {
                             "instrument": instrument,
                             "timeframe": "M15",
-                            "candle_open_time": prev_candle_time.isoformat(),
+                            "candle_open_time": candle_time.isoformat(),
                         }
                         try:
                             callback(instrument, candle_data)
                         except Exception as e:
                             self.logger.log_error("data_engine", f"Callback error: {e}")
 
-                    current_candle_times[instrument] = candle_open_time
+                except Exception as e:
+                    self.logger.log_error("data_engine",
+                                          f"Poll error for {instrument}: {e}")
 
-            except requests.RequestException as e:
-                self.logger.log_error(
-                    "data_engine",
-                    f"Stream disconnected: {e}",
-                    {"reconnect_delay": reconnect_delay},
-                )
-                time.sleep(reconnect_delay)
-                reconnect_delay = min(reconnect_delay * 2, 60)
-            except Exception as e:
-                self.logger.log_error("data_engine", f"Stream fatal error: {e}")
-                time.sleep(reconnect_delay)
-                reconnect_delay = min(reconnect_delay * 2, 60)
+            time.sleep(5)
+
+    def get_open_positions(self) -> list:
+        """Get all open positions from MT5.
+
+        Returns:
+            List of position dicts with symbol, ticket, type, volume, etc.
+        """
+        positions = mt5.positions_get()
+        if positions is None:
+            return []
+
+        result = []
+        for pos in positions:
+            result.append({
+                "ticket": pos.ticket,
+                "symbol": self.from_mt5_symbol(pos.symbol),
+                "mt5_symbol": pos.symbol,
+                "type": "LONG" if pos.type == mt5.ORDER_TYPE_BUY else "SHORT",
+                "volume": pos.volume,
+                "price_open": pos.price_open,
+                "sl": pos.sl,
+                "tp": pos.tp,
+                "profit": pos.profit,
+                "time": datetime.fromtimestamp(pos.time, tz=timezone.utc).isoformat(),
+            })
+        return result
 
     def warm_up(self, instruments: list, timeframes: list):
         """Fetch historical candles for all instrument/timeframe combinations on startup.
 
         Args:
-            instruments: List of OANDA instrument names.
+            instruments: List of config instrument names.
             timeframes: List of timeframe granularities.
         """
         for instrument in instruments:
@@ -401,3 +431,8 @@ class DataEngine:
                     "data_engine",
                     f"Warm-up complete: {instrument} {timeframe}",
                 )
+
+    def shutdown(self):
+        """Cleanly shut down the MT5 connection."""
+        mt5.shutdown()
+        self.logger.log("INFO", "data_engine", "MT5 connection closed")
