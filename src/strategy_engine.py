@@ -56,7 +56,7 @@ class StrategyEngine:
         """Process a new completed candle through the full signal pipeline.
 
         Args:
-            instrument: OANDA instrument name.
+            instrument: Instrument name (e.g. EUR_USD).
             df: DataFrame with all FeatureEngine columns computed.
 
         Returns:
@@ -72,7 +72,7 @@ class StrategyEngine:
         """Run the full signal pipeline through all gates.
 
         Args:
-            instrument: OANDA instrument name.
+            instrument: Instrument name (e.g. EUR_USD).
             df: DataFrame with all FeatureEngine columns computed.
 
         Returns:
@@ -216,7 +216,7 @@ class StrategyEngine:
         """Detect a new sweep or return an existing active sweep.
 
         Args:
-            instrument: OANDA instrument name.
+            instrument: Instrument name (e.g. EUR_USD).
             df: DataFrame with FeatureEngine columns.
 
         Returns:
@@ -241,7 +241,7 @@ class StrategyEngine:
         """Detect a BOS or return an existing active BOS for this sweep.
 
         Args:
-            instrument: OANDA instrument name.
+            instrument: Instrument name (e.g. EUR_USD).
             df: DataFrame with FeatureEngine columns.
             sweep: Active sweep dict.
 
@@ -279,8 +279,8 @@ class StrategyEngine:
         """Check if price has entered a pullback zone.
 
         Args:
-            instrument: OANDA instrument name.
-            df: DataFrame with OHLC data.
+            instrument: Instrument name (e.g. EUR_USD).
+            df: DataFrame with OHLC and feature data.
             sweep: Active sweep dict.
             bos: Active BOS dict.
 
@@ -392,7 +392,7 @@ class StrategyEngine:
         """Remove all active setups for an instrument.
 
         Args:
-            instrument: OANDA instrument name.
+            instrument: Instrument name (e.g. EUR_USD).
             reason: Reason for invalidation.
         """
         self.active_sweeps.pop(instrument, None)

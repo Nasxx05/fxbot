@@ -1,7 +1,6 @@
 broker:
+  platform: "metatrader5"
   environment: "demo"
-  base_url_demo: "https://api-fxpractice.oanda.com"
-  base_url_live: "https://api-fxtrade.oanda.com"
   instruments:
     - "EUR_USD"
     - "GBP_USD"

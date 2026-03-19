@@ -59,7 +59,7 @@ class BacktestEngine:
         """Load OHLC data from SQLite for the given range.
 
         Args:
-            instrument: OANDA instrument name.
+            instrument: Instrument name (e.g. EUR_USD).
             timeframe: Candle granularity.
             start_date: Start date string (YYYY-MM-DD).
             end_date: End date string (YYYY-MM-DD).
@@ -95,7 +95,7 @@ class BacktestEngine:
         """Run a full backtest for a single instrument over a date range.
 
         Args:
-            instrument: OANDA instrument name.
+            instrument: Instrument name (e.g. EUR_USD).
             start_date: Start date (YYYY-MM-DD).
             end_date: End date (YYYY-MM-DD).
             spread_pips: Fixed spread to use, or None for simulated spread.
@@ -679,7 +679,7 @@ class BacktestEngine:
         """Run walk-forward validation splitting IS and OOS periods.
 
         Args:
-            instrument: OANDA instrument name.
+            instrument: Instrument name (e.g. EUR_USD).
             full_start: Start date (YYYY-MM-DD).
             full_end: End date (YYYY-MM-DD).
             is_pct: In-sample percentage (default 0.70).

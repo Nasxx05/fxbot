@@ -38,7 +38,7 @@ class SpreadController:
         """Get or create the rolling spread history for an instrument.
 
         Args:
-            instrument: OANDA instrument name.
+            instrument: Instrument name (e.g. EUR_USD).
 
         Returns:
             Deque of recent spread readings.
@@ -54,7 +54,7 @@ class SpreadController:
         max_pips threshold and spike detection.
 
         Args:
-            instrument: OANDA instrument name.
+            instrument: Instrument name (e.g. EUR_USD).
 
         Returns:
             Tuple of (acceptable: bool, current_spread: float, reason: str or None).
@@ -82,7 +82,7 @@ class SpreadController:
         """Return the mean of the last N spread readings.
 
         Args:
-            instrument: OANDA instrument name.
+            instrument: Instrument name (e.g. EUR_USD).
 
         Returns:
             Rolling average spread, or None if fewer than 5 readings.
@@ -101,7 +101,7 @@ class SpreadController:
             entry: Intended entry price.
             stop_loss: Stop loss price.
             take_profit: Take profit price.
-            instrument: OANDA instrument name.
+            instrument: Instrument name (e.g. EUR_USD).
             direction: LONG or SHORT.
 
         Returns:
@@ -136,7 +136,7 @@ class SpreadController:
         """Check if slippage is within acceptable limits.
 
         Args:
-            instrument: OANDA instrument name.
+            instrument: Instrument name (e.g. EUR_USD).
             intended_price: The price the order was supposed to fill at.
             actual_fill_price: The price the order actually filled at.
             direction: LONG or SHORT.
@@ -186,7 +186,7 @@ class SpreadController:
         """Convert a pip value to a price difference.
 
         Args:
-            instrument: OANDA instrument name.
+            instrument: Instrument name (e.g. EUR_USD).
             pips: Number of pips.
 
         Returns:
@@ -203,7 +203,7 @@ class SpreadController:
         """Convert a price difference to pips.
 
         Args:
-            instrument: OANDA instrument name.
+            instrument: Instrument name (e.g. EUR_USD).
             price_diff: Absolute price difference.
 
         Returns:

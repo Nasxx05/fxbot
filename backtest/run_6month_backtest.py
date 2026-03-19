@@ -1,4 +1,9 @@
-"""Run 6-month backtest on all 4 pairs using historical M15 data."""
+"""Run 6-month backtest on all 4 pairs using historical M15 data.
+
+Usage:
+    python backtest/run_6month_backtest.py              # Run using existing SQLite data
+    python backtest/run_6month_backtest.py --preload     # Fetch data from MT5 first, then run
+"""
 
 import json
 import os
@@ -25,10 +30,45 @@ SPREAD_MAP = {
 }
 
 
+def preload_data_from_mt5(config):
+    """Fetch historical data from MT5 and store in SQLite for backtesting.
+
+    Requires MT5 terminal to be open and logged in.
+    """
+    try:
+        from src.data_engine import DataEngine
+    except Exception as e:
+        print(f"ERROR: Cannot import DataEngine — {e}")
+        print("Make sure MetaTrader 5 terminal is running on Windows.")
+        sys.exit(1)
+
+    print("Connecting to MetaTrader 5 to preload historical data...")
+    data_engine = DataEngine(config)
+
+    timeframes = ["M15"]
+    candle_count = 50000  # ~1 year of M15 data
+
+    for instrument in INSTRUMENTS:
+        for tf in timeframes:
+            print(f"  Fetching {instrument} {tf} ({candle_count} candles)...")
+            df = data_engine.fetch_historical_candles(instrument, tf, candle_count)
+            if df.empty:
+                print(f"  WARNING: No data returned for {instrument} {tf}")
+            else:
+                print(f"  Stored {len(df)} candles for {instrument} {tf}")
+
+    data_engine.shutdown()
+    print("Data preload complete.\n")
+
+
 def run_backtests():
     """Run backtests on all 4 pairs for the 6-month period."""
     with open("config/config.yaml", "r") as f:
         config = yaml.safe_load(f)
+
+    # Check for --preload flag
+    if "--preload" in sys.argv:
+        preload_data_from_mt5(config)
 
     logger = BotLogger(config)
     engine = BacktestEngine(config, logger)

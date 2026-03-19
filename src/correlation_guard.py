@@ -22,7 +22,7 @@ class CorrelationGuard:
         """Mark an instrument as having an open trade.
 
         Args:
-            instrument: OANDA instrument name.
+            instrument: Instrument name (e.g. EUR_USD).
         """
         self.open_trades_tracker[instrument] = True
         self.logger.log("DEBUG", "correlation_guard",
@@ -32,7 +32,7 @@ class CorrelationGuard:
         """Mark an instrument as no longer having an open trade.
 
         Args:
-            instrument: OANDA instrument name.
+            instrument: Instrument name (e.g. EUR_USD).
         """
         self.open_trades_tracker[instrument] = False
         self.logger.log("DEBUG", "correlation_guard",
@@ -42,7 +42,7 @@ class CorrelationGuard:
         """Check if any instrument in the same correlation group has an open trade.
 
         Args:
-            instrument: OANDA instrument name to check.
+            instrument: Instrument name to check (e.g. EUR_USD).
 
         Returns:
             Tuple of (blocked: bool, blocking_instrument: str or None).

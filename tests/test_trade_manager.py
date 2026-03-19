@@ -1,9 +1,9 @@
-"""Unit tests for the TradeManager module."""
+"""Unit tests for the TradeManager module (MetaTrader 5)."""
 
 import os
 import unittest
 from datetime import datetime, timedelta, timezone
-from unittest.mock import MagicMock, patch
+from unittest.mock import MagicMock
 
 import numpy as np
 import pandas as pd
@@ -73,6 +73,7 @@ class TestTradeManager(unittest.TestCase):
         self.execution_engine.spread_controller = MagicMock()
         self.execution_engine.spread_controller.pips_to_price.return_value = 0.0001
         self.execution_engine.close_trade_at_market.return_value = True
+        self.execution_engine.modify_trade_sl.return_value = True
 
         self.volatility_engine = MagicMock()
         self.volatility_engine.is_volatility_collapsing.return_value = False
@@ -102,12 +103,9 @@ class TestTradeManager(unittest.TestCase):
         trade["breakeven_moved"] = True
         self.tm.open_trades[trade["trade_id"]] = trade
 
-        old_sl = trade["stop_loss"]
-        # No trailing stop should fire since r < 1.0 for this test
         self.volatility_engine.get_atr_value.return_value = 0.005
         self.tm.manage_trade(trade, 1.2055, _make_df())
 
-        # SL may change due to trailing, but breakeven shouldn't be triggered again
         self.assertTrue(trade["breakeven_moved"])
 
     def test_partial_close_at_2r(self):
@@ -129,7 +127,9 @@ class TestTradeManager(unittest.TestCase):
         self.tm.manage_trade(trade, 1.2150, _make_df())
 
         self.execution_engine.close_trade_at_market.assert_called_once_with(
-            trade["trade_id"], "TP2_HIT")
+            trade["trade_id"], trade["instrument"],
+            trade["direction"], trade["position_size"],
+            "TP2_HIT")
 
     def test_close_on_volatility_collapse(self):
         """manage_trade closes trade on volatility collapse."""
@@ -140,7 +140,9 @@ class TestTradeManager(unittest.TestCase):
         self.tm.manage_trade(trade, 1.2010, _make_df())
 
         self.execution_engine.close_trade_at_market.assert_called_once_with(
-            trade["trade_id"], "VOLATILITY_COLLAPSE")
+            trade["trade_id"], trade["instrument"],
+            trade["direction"], trade["position_size"],
+            "VOLATILITY_COLLAPSE")
 
     def test_close_on_max_duration(self):
         """manage_trade closes trade on max duration exceeded."""
@@ -151,31 +153,29 @@ class TestTradeManager(unittest.TestCase):
         self.tm.manage_trade(trade, 1.2010, _make_df())
 
         self.execution_engine.close_trade_at_market.assert_called_once_with(
-            trade["trade_id"], "MAX_DURATION_EXCEEDED")
+            trade["trade_id"], trade["instrument"],
+            trade["direction"], trade["position_size"],
+            "MAX_DURATION_EXCEEDED")
 
-    def test_sl_modification_never_worsens(self):
-        """SL modification is rejected if it would worsen the SL."""
+    def test_sl_modification_never_worsens_long(self):
+        """SL modification is rejected if it would worsen LONG SL."""
         trade = _make_trade(direction="LONG", entry=1.2000, sl=1.2010)
         self.tm.open_trades[trade["trade_id"]] = trade
 
         # Try to move SL lower (worse for LONG)
-        self.tm.modify_trade_sl(trade["trade_id"], 1.2005)
+        self.tm.modify_trade_sl(trade, 1.2005)
 
-        # Should NOT call the OANDA API
-        with patch("src.trade_manager.requests.put") as mock_put:
-            self.tm.modify_trade_sl(trade["trade_id"], 1.2005)
-            mock_put.assert_not_called()
+        # Should NOT call execution engine
+        self.execution_engine.modify_trade_sl.assert_not_called()
 
     def test_sl_modification_allowed_when_better(self):
         """SL modification succeeds when moving in profitable direction."""
         trade = _make_trade(direction="LONG", entry=1.2000, sl=1.1950)
         self.tm.open_trades[trade["trade_id"]] = trade
 
-        mock_resp = MagicMock()
-        mock_resp.raise_for_status = MagicMock()
-        with patch("src.trade_manager.requests.put", return_value=mock_resp) as mock_put:
-            self.tm.modify_trade_sl(trade["trade_id"], 1.1980)
-            mock_put.assert_called_once()
+        self.tm.modify_trade_sl(trade, 1.1980)
+
+        self.execution_engine.modify_trade_sl.assert_called_once()
 
     def test_register_trade_persists(self):
         """register_trade saves to open_trades.json."""
