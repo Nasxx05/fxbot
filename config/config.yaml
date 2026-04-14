@@ -1,3 +1,10 @@
+# Bot operating mode:
+#   "live"         - Fully automated. Places orders on MT5 and manages them.
+#   "signal_only"  - Analysis only. Sends trade signals to Telegram for manual
+#                    entry. No orders are placed. Signal lifecycle (entry hit,
+#                    TP1, TP2, SL, invalidation) is tracked and alerted.
+mode: "signal_only"
+
 broker:
   platform: "metatrader5"
   environment: "demo"
@@ -101,3 +108,26 @@ logging:
 telegram:
   enabled: true
   daily_summary_utc: "21:00"
+  # Token and chat id are read from env vars TELEGRAM_BOT_TOKEN and
+  # TELEGRAM_CHAT_ID (see .env.example). Values below are optional
+  # fallbacks used if the env vars are not set.
+  bot_token: ""
+  chat_id: ""
+
+# Settings specific to signal_only mode. Ignored in live mode.
+signal_monitor:
+  # How often (seconds) to poll current price for pending signals.
+  poll_interval_seconds: 15
+  # Send an alert when price first enters the pullback/entry zone.
+  alert_on_entry_zone: true
+  # Send an alert when TP1/TP2/SL is touched (high of candle for SHORTs etc.).
+  alert_on_tp_sl_hit: true
+  # Send an alert if a pending signal expires (pullback_candle_limit reached)
+  # or the market structure invalidates the setup.
+  alert_on_invalidation: true
+  # Max time a pending (unfilled) signal is tracked before being discarded.
+  pending_signal_ttl_hours: 6
+  # Max time a filled (entered) signal is tracked before being discarded.
+  filled_signal_ttl_hours: 48
+  # Path where active signals are persisted so restarts do not lose state.
+  state_file_path: "data/signal_monitor_state.json"

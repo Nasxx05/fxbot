@@ -27,8 +27,11 @@ class AlertSystem:
         telegram = config.get("telegram", {})
         self.enabled = telegram.get("enabled", False)
 
-        self.bot_token = os.environ.get("TELEGRAM_BOT_TOKEN", "")
-        self.chat_id = os.environ.get("TELEGRAM_CHAT_ID", "")
+        # Env vars take precedence; config.yaml values are fallbacks.
+        self.bot_token = (os.environ.get("TELEGRAM_BOT_TOKEN", "")
+                          or telegram.get("bot_token", ""))
+        self.chat_id = (os.environ.get("TELEGRAM_CHAT_ID", "")
+                        or str(telegram.get("chat_id", "")))
 
         self._queue = Queue()
         self._worker = threading.Thread(target=self._send_worker, daemon=True)
@@ -202,6 +205,141 @@ class AlertSystem:
             f"*BOT ERROR* in {module}\n"
             f"{error}\n"
             f"Please check logs."
+        )
+
+    # ------------------------------------------------------------------
+    # Signal-only mode alerts
+    # ------------------------------------------------------------------
+    def _fmt_price(self, value: float, instrument: str) -> str:
+        """Format a price with sensible decimals for the instrument."""
+        if value is None:
+            return "-"
+        if "JPY" in instrument:
+            return f"{value:.3f}"
+        if instrument == "XAU_USD":
+            return f"{value:.2f}"
+        return f"{value:.5f}"
+
+    def _price_to_pips(self, instrument: str, diff: float) -> float:
+        """Convert an absolute price difference into pips for display."""
+        if "JPY" in instrument:
+            return diff * 100
+        if instrument == "XAU_USD":
+            return diff * 10
+        return diff * 10000
+
+    def alert_new_signal(self, signal: dict):
+        """Send a NEW SIGNAL message for signal-only mode.
+
+        The user receives all parameters needed to enter the trade manually.
+
+        Args:
+            signal: Sized signal dict (must contain position_size, entry,
+                    SL, TP1, TP2, RR, session, ATR, instrument, direction).
+        """
+        instrument = signal.get("instrument", "")
+        pair = instrument.replace("_", "/")
+        direction = signal.get("direction", "")
+        arrow = "LONG" if direction == "LONG" else "SHORT"
+
+        entry = signal.get("entry_price", 0)
+        sl = signal.get("stop_loss", 0)
+        tp1 = signal.get("take_profit_1", 0)
+        tp2 = signal.get("take_profit_2", 0)
+        size = signal.get("position_size", 0) or 0
+        rr = signal.get("risk_reward_adjusted", 0)
+        session = signal.get("session", "")
+        atr = signal.get("atr_at_signal", 0) or 0
+        spread = signal.get("current_spread_pips", 0)
+        method = signal.get("entry_method", "")
+
+        risk_pips = self._price_to_pips(instrument, abs(entry - sl))
+        tp1_pips = self._price_to_pips(instrument, abs(tp1 - entry))
+        tp2_pips = self._price_to_pips(instrument, abs(tp2 - entry))
+        atr_pips = self._price_to_pips(instrument, atr)
+
+        msg = (
+            f"*NEW SIGNAL — {pair}*\n"
+            f"Direction: *{arrow}*  (limit entry)\n"
+            f"\n"
+            f"Entry: `{self._fmt_price(entry, instrument)}`\n"
+            f"Stop Loss: `{self._fmt_price(sl, instrument)}`  "
+            f"({risk_pips:.1f} pips)\n"
+            f"TP1 (2R): `{self._fmt_price(tp1, instrument)}`  "
+            f"({tp1_pips:.1f} pips) — close 50%\n"
+            f"TP2 (3R): `{self._fmt_price(tp2, instrument)}`  "
+            f"({tp2_pips:.1f} pips) — close rest\n"
+            f"\n"
+            f"Suggested lot: *{size:.2f}*   (1% account risk)\n"
+            f"R:R (spread-adj): *1:{rr:.2f}*\n"
+            f"Session: {session}  |  Spread: {spread:.1f}p  |  "
+            f"ATR: {atr_pips:.1f}p\n"
+            f"Setup: {method}\n"
+            f"\n"
+            f"_Manage: move SL to BE at +1R, trail by 1×ATR after BE._"
+        )
+        self.send(msg)
+
+    def alert_signal_entry_hit(self, signal: dict, price: float):
+        """Alert that price has reached the entry zone."""
+        pair = signal.get("instrument", "").replace("_", "/")
+        direction = signal.get("direction", "")
+        entry = signal.get("entry_price", 0)
+        inst = signal.get("instrument", "")
+        self.send(
+            f"*ENTRY ZONE HIT — {pair} {direction}*\n"
+            f"Price: `{self._fmt_price(price, inst)}`  "
+            f"(limit: `{self._fmt_price(entry, inst)}`)\n"
+            f"_If you have not placed the order yet, consider entering now._"
+        )
+
+    def alert_signal_tp1_hit(self, signal: dict, price: float):
+        """Alert that TP1 (2R) has been reached."""
+        pair = signal.get("instrument", "").replace("_", "/")
+        direction = signal.get("direction", "")
+        inst = signal.get("instrument", "")
+        tp1 = signal.get("take_profit_1", 0)
+        self.send(
+            f"*TP1 HIT — {pair} {direction}*  +2R\n"
+            f"Price: `{self._fmt_price(price, inst)}`  "
+            f"(TP1: `{self._fmt_price(tp1, inst)}`)\n"
+            f"_Suggest: close 50% and move SL to breakeven._"
+        )
+
+    def alert_signal_tp2_hit(self, signal: dict, price: float):
+        """Alert that TP2 (3R) has been reached."""
+        pair = signal.get("instrument", "").replace("_", "/")
+        direction = signal.get("direction", "")
+        inst = signal.get("instrument", "")
+        tp2 = signal.get("take_profit_2", 0)
+        self.send(
+            f"*TP2 HIT — {pair} {direction}*  +3R  WIN\n"
+            f"Price: `{self._fmt_price(price, inst)}`  "
+            f"(TP2: `{self._fmt_price(tp2, inst)}`)\n"
+            f"_Suggest: close remainder._"
+        )
+
+    def alert_signal_sl_hit(self, signal: dict, price: float):
+        """Alert that the stop loss has been hit."""
+        pair = signal.get("instrument", "").replace("_", "/")
+        direction = signal.get("direction", "")
+        inst = signal.get("instrument", "")
+        sl = signal.get("stop_loss", 0)
+        self.send(
+            f"*SL HIT — {pair} {direction}*  -1R\n"
+            f"Price: `{self._fmt_price(price, inst)}`  "
+            f"(SL: `{self._fmt_price(sl, inst)}`)\n"
+            f"_Trade closed. Next setup will be sent when conditions align._"
+        )
+
+    def alert_signal_invalidated(self, signal: dict, reason: str):
+        """Alert that a pending signal has been invalidated before entry."""
+        pair = signal.get("instrument", "").replace("_", "/")
+        direction = signal.get("direction", "")
+        self.send(
+            f"*SIGNAL INVALIDATED — {pair} {direction}*\n"
+            f"Reason: {reason}\n"
+            f"_Do not take this entry._"
         )
 
     def alert_daily_summary(self, summary: dict):
